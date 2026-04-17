@@ -11,3 +11,4 @@ pandas>=2.2.0
 
 # Utilities
 python-dotenv>=1.0.0
+pytz>=2024.1

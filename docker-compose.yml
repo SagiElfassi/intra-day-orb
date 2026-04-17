@@ -1,0 +1,50 @@
+version: "3.9"
+
+# Shared volume so bot and dashboard read the same SQLite file
+volumes:
+  orb_data:
+
+services:
+  # ── Trading Bot ──────────────────────────────────────────────────────────────
+  bot:
+    build: .
+    image: orb-bot:latest
+    container_name: orb_bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/orb_trades.db
+    volumes:
+      - orb_data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ── Streamlit Dashboard ──────────────────────────────────────────────────────
+  dashboard:
+    build: .
+    image: orb-bot:latest
+    container_name: orb_dashboard
+    restart: unless-stopped
+    command: >
+      streamlit run dashboard.py
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+      --browser.gatherUsageStats=false
+    env_file: .env
+    environment:
+      DB_PATH: /data/orb_trades.db
+    volumes:
+      - orb_data:/data
+    ports:
+      - "8501:8501"
+    depends_on:
+      - bot
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

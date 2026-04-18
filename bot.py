@@ -6,10 +6,14 @@ Production-ready automated trading system using Alpaca Markets API (alpaca-py).
 Architecture:
   - StockDataStream (WebSocket) for real-time 1-min bar data
   - Asyncio-native event loop with executor-wrapped blocking calls
-  - Per-symbol state machine: WAITING_RANGE → SCANNING → IN_TRADE → COMPLETED
+  - Per-symbol state machine: WAITING_RANGE → SCANNING → SUBMITTING → IN_TRADE → COMPLETED
   - Bracket orders (entry + TP + SL) submitted atomically to Alpaca
   - SQLite for trade/event logging (read by dashboard.py)
   - Kill switch + auto-flatten safety protocols
+  - WebSocket reconnection with exponential backoff + REST resync
+  - Crash recovery: restores in-flight trades from DB on startup
+  - Orphan order cleanup: cancels bracket legs when position is gone
+  - Partial fill tracking: records actual filled qty, not just requested
 """
 
 import asyncio
@@ -141,7 +145,7 @@ class Config:
     max_daily_loss_pct: float = field(
         default_factory=lambda: float(os.environ.get("MAX_DAILY_LOSS_PCT", "2.0"))
     )
-    flatten_hour: int = 15   # 3 PM
+    flatten_hour: int = 15    # 3 PM
     flatten_minute: int = 55  # :55 → 3:55 PM EST
 
     # Data feed: IEX (free/paper) or SIP (paid/live)
@@ -163,26 +167,28 @@ class Config:
 
 # ── Per-Symbol State ───────────────────────────────────────────────────────────
 
-# Status values for the per-symbol state machine
-STATUS_WAITING = "WAITING_RANGE"   # Collecting ORB bars
-STATUS_SCANNING = "SCANNING"       # Range set; watching for breakout
-STATUS_IN_TRADE = "IN_TRADE"       # Bracket order live
-STATUS_COMPLETED = "COMPLETED"     # Done for the day
-STATUS_INVALID = "INVALID"         # Insufficient bars; skip today
+STATUS_WAITING    = "WAITING_RANGE"  # Collecting ORB bars
+STATUS_SCANNING   = "SCANNING"       # Range set; watching for breakout
+STATUS_SUBMITTING = "SUBMITTING"     # Order REST call in flight — blocks re-entry
+STATUS_IN_TRADE   = "IN_TRADE"       # Bracket order live
+STATUS_COMPLETED  = "COMPLETED"      # Done for the day
+STATUS_INVALID    = "INVALID"        # Insufficient bars; skip today
 
 
 @dataclass
 class TickerState:
     symbol: str
     status: str = STATUS_WAITING
-    bars: List[Bar] = field(default_factory=list)       # ORB window bars
+    bars: List[Bar] = field(default_factory=list)      # ORB window bars
     range_high: Optional[float] = None
     range_low: Optional[float] = None
     range_mid: Optional[float] = None
     order_id: Optional[str] = None
     trade_db_id: Optional[int] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    trade_date: Optional[str] = None                    # "YYYY-MM-DD" for today's session
+    trade_date: Optional[str] = None                   # "YYYY-MM-DD" for today's session
+    entry_qty_requested: int = 0                       # qty we sent to Alpaca
+    entry_qty_filled: int = 0                          # actual filled qty (may differ on partial fill)
 
 
 # ── Database Manager ───────────────────────────────────────────────────────────
@@ -320,6 +326,17 @@ class DatabaseManager:
             )
             await db.commit()
 
+    async def load_active_trades(self, today: str) -> List[dict]:
+        """Return today's trades that were still open at last shutdown."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM trades WHERE date=? AND status IN ('PENDING','OPEN')",
+                (today,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
 
 # ── Core Bot ───────────────────────────────────────────────────────────────────
 
@@ -345,14 +362,14 @@ class ORBBot:
             secret_key=config.api_secret,
         )
 
-        # Per-symbol state — access always under state.lock
         self.states: Dict[str, TickerState] = {
             sym: TickerState(symbol=sym) for sym in config.symbols
         }
 
         self.starting_equity: float = 0.0
         self.kill_switch_triggered: bool = False
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._last_bar_time: float = 0.0          # epoch seconds; updated on every bar
+        self._stream_reconnect_lock = asyncio.Lock()  # prevents concurrent reconnects
 
     # ── Initialisation ─────────────────────────────────────────────────────────
 
@@ -361,6 +378,96 @@ class ORBBot:
         account = await loop.run_in_executor(None, self.trading_client.get_account)
         self.starting_equity = float(account.equity)
         logger.info("Starting equity: $%.2f", self.starting_equity)
+
+    # ── Crash Recovery ─────────────────────────────────────────────────────────
+
+    async def _resume_from_db(self):
+        """
+        Called once at startup. Queries the DB for trades that were PENDING or OPEN
+        at last shutdown, then verifies their status against Alpaca's REST API.
+        Restores IN_TRADE state for positions that are still open; marks the rest closed.
+        """
+        today = datetime.now(self.config.tz).strftime("%Y-%m-%d")
+        active = await self.db.load_active_trades(today)
+        if not active:
+            return
+
+        logger.info("Resume: found %d active trade(s) in DB for %s", len(active), today)
+        loop = asyncio.get_running_loop()
+
+        for trade in active:
+            symbol   = trade["symbol"]
+            order_id = trade["order_id"]
+            trade_id = trade["id"]
+
+            if symbol not in self.states:
+                continue
+
+            state = self.states[symbol]
+
+            try:
+                order = await loop.run_in_executor(
+                    None,
+                    lambda oid=order_id: self.trading_client.get_order_by_id(oid),
+                )
+                order_status = str(order.status).lower()
+
+                if order_status in ("filled", "partially_filled", "accepted", "pending_new", "new"):
+                    filled_qty = int(float(order.filled_qty or trade["qty"]))
+                    async with state.lock:
+                        state.status              = STATUS_IN_TRADE
+                        state.order_id            = order_id
+                        state.trade_db_id         = trade_id
+                        state.trade_date          = today
+                        state.entry_qty_requested = int(float(trade["qty"]))
+                        state.entry_qty_filled    = filled_qty
+                    logger.info(
+                        "%s | RESUMED → IN_TRADE  order=%s  filled_qty=%d",
+                        symbol, order_id, filled_qty,
+                    )
+                    await self.db.log_event(
+                        "RESUMED",
+                        f"{symbol}: restored IN_TRADE from DB (order {order_id})",
+                    )
+
+                elif order_status in ("canceled", "expired", "done_for_day", "stopped", "rejected"):
+                    await self.db.update_trade(
+                        trade_id,
+                        status="CLOSED_CANCELLED",
+                        closed_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    async with state.lock:
+                        state.trade_date = today
+                    logger.info(
+                        "%s | Order %s was %s — marked closed in DB",
+                        symbol, order_id, order_status,
+                    )
+
+                else:
+                    # Unknown status — default to restoring IN_TRADE conservatively
+                    logger.warning(
+                        "%s | Unknown order status '%s' on resume — assuming IN_TRADE",
+                        symbol, order_status,
+                    )
+                    async with state.lock:
+                        state.status      = STATUS_IN_TRADE
+                        state.order_id    = order_id
+                        state.trade_db_id = trade_id
+                        state.trade_date  = today
+                        state.entry_qty_requested = int(float(trade["qty"]))
+
+            except Exception as exc:
+                # REST call failed — assume position is still open to be conservative
+                logger.error(
+                    "%s | Failed to verify order %s on resume: %s — assuming IN_TRADE",
+                    symbol, order_id, exc,
+                )
+                async with state.lock:
+                    state.status      = STATUS_IN_TRADE
+                    state.order_id    = order_id
+                    state.trade_db_id = trade_id
+                    state.trade_date  = today
+                    state.entry_qty_requested = int(float(trade["qty"]))
 
     # ── WebSocket Bar Handler ──────────────────────────────────────────────────
 
@@ -373,9 +480,11 @@ class ORBBot:
         if symbol not in self.states:
             return
 
+        # Update heartbeat timestamp on every received bar
+        self._last_bar_time = datetime.now(timezone.utc).timestamp()
+
         state = self.states[symbol]
 
-        # Persist every bar for the dashboard price chart
         await self.db.save_bar(bar)
 
         bar_time_est = bar.timestamp.astimezone(self.config.tz)
@@ -384,17 +493,22 @@ class ORBBot:
         async with state.lock:
             # Reset state at the start of a new trading day
             if state.trade_date != today:
-                state.status = STATUS_WAITING
-                state.bars = []
-                state.range_high = state.range_low = state.range_mid = None
-                state.order_id = state.trade_db_id = None
-                state.trade_date = today
+                state.status              = STATUS_WAITING
+                state.bars                = []
+                state.range_high          = state.range_low = state.range_mid = None
+                state.order_id            = state.trade_db_id = None
+                state.trade_date          = today
+                state.entry_qty_requested = 0
+                state.entry_qty_filled    = 0
 
-            if state.status in (STATUS_IN_TRADE, STATUS_COMPLETED, STATUS_INVALID):
+            # STATUS_SUBMITTING blocks re-entry while an order REST call is in flight
+            if state.status in (
+                STATUS_IN_TRADE, STATUS_SUBMITTING, STATUS_COMPLETED, STATUS_INVALID
+            ):
                 return
 
             orb_start = bar_time_est.replace(hour=9, minute=30, second=0, microsecond=0)
-            orb_end = orb_start + timedelta(minutes=self.config.orb_minutes)
+            orb_end   = orb_start + timedelta(minutes=self.config.orb_minutes)
 
             if orb_start <= bar_time_est < orb_end:
                 await self._process_range_bar(state, bar, today, bar_time_est)
@@ -408,19 +522,16 @@ class ORBBot:
         today: str,
         bar_time_est: datetime,
     ):
-        """Accumulate bars for the ORB window and finalize when complete."""
         state.bars.append(bar)
         logger.debug(
             "%s | ORB bar %d/%d  H=%.2f L=%.2f C=%.2f",
             state.symbol, len(state.bars), self.config.orb_minutes,
             bar.high, bar.low, bar.close,
         )
-
         if len(state.bars) >= self.config.orb_minutes:
             await self._finalize_range(state, today)
 
     async def _finalize_range(self, state: TickerState, today: str):
-        """Validate bar count and set ORB High/Low/Mid."""
         bars_received = len(state.bars)
         valid = bars_received >= self.config.min_bars_required
 
@@ -440,8 +551,8 @@ class ORBBot:
             return
 
         state.range_high = max(b.high for b in state.bars)
-        state.range_low = min(b.low for b in state.bars)
-        state.range_mid = (state.range_high + state.range_low) / 2
+        state.range_low  = min(b.low  for b in state.bars)
+        state.range_mid  = (state.range_high + state.range_low) / 2
 
         # Volume filter
         orb_volume = sum(int(b.volume) for b in state.bars)
@@ -462,7 +573,6 @@ class ORBBot:
             return
 
         state.status = STATUS_SCANNING
-
         logger.info(
             "%s | ORB range SET — High=%.2f  Low=%.2f  Mid=%.2f  (bars=%d)",
             state.symbol, state.range_high, state.range_low,
@@ -483,9 +593,13 @@ class ORBBot:
         elif close < state.range_low:
             signal = "SHORT"
         else:
-            return  # No breakout
+            return
 
-        # Spread filter — check just before order submission
+        # Set SUBMITTING *before* any await so rapid-fire bars can't double-enter.
+        # The lock from on_bar is still held here, so this is atomic.
+        state.status = STATUS_SUBMITTING
+
+        # Spread filter — check live quote just before order submission
         spread_pct = await self._fetch_spread_pct(state.symbol)
         if self.config.max_spread_pct > 0 and spread_pct > self.config.max_spread_pct:
             state.status = STATUS_COMPLETED
@@ -510,7 +624,7 @@ class ORBBot:
                 symbol_or_symbols=symbol,
                 timeframe=TimeFrame.Day,
                 start=datetime.now(timezone.utc) - timedelta(days=30),
-                end=datetime.now(timezone.utc) - timedelta(days=1),
+                end=datetime.now(timezone.utc)   - timedelta(days=1),
                 feed=self.config.data_feed,
             )
             resp = await loop.run_in_executor(
@@ -560,22 +674,25 @@ class ORBBot:
         signal: str,
         today: str,
     ):
-        """Build and submit a bracket order atomically to Alpaca."""
-        close = bar.close
+        """
+        Build and submit a bracket order atomically to Alpaca.
+        state.status is already STATUS_SUBMITTING when this is called.
+        On failure, state moves to STATUS_COMPLETED (skip the day — don't retry).
+        """
+        close     = bar.close
         orb_range = state.range_high - state.range_low
-
-        qty = max(1, math.floor(self.config.position_size_usd / close))
+        qty       = max(1, math.floor(self.config.position_size_usd / close))
 
         if signal == "LONG":
-            side = OrderSide.BUY
+            side     = OrderSide.BUY
             tp_price = round(close + orb_range * self.config.risk_ratio, 2)
             sl_price = round(
                 state.range_mid if self.config.stop_loss_type == "midpoint"
                 else state.range_low,
                 2,
             )
-        else:  # SHORT
-            side = OrderSide.SELL
+        else:
+            side     = OrderSide.SELL
             tp_price = round(close - orb_range * self.config.risk_ratio, 2)
             sl_price = round(
                 state.range_mid if self.config.stop_loss_type == "midpoint"
@@ -594,13 +711,15 @@ class ORBBot:
         )
 
         try:
-            loop = asyncio.get_running_loop()
+            loop  = asyncio.get_running_loop()
             order = await loop.run_in_executor(
                 None, self.trading_client.submit_order, order_request
             )
 
-            state.order_id = str(order.id)
-            state.status = STATUS_IN_TRADE
+            state.order_id            = str(order.id)
+            state.status              = STATUS_IN_TRADE
+            state.entry_qty_requested = qty
+            state.entry_qty_filled    = 0  # updated later by fill monitor
 
             trade_id = await self.db.insert_trade(
                 date=today,
@@ -624,13 +743,14 @@ class ORBBot:
             )
 
         except Exception as exc:
+            # Don't leave state stuck in SUBMITTING — mark day as done
+            state.status = STATUS_COMPLETED
             logger.error("%s | Order submission FAILED: %s", state.symbol, exc)
             await self.db.log_event("ORDER_ERROR", f"{state.symbol}: {exc}")
 
     # ── Risk Management ────────────────────────────────────────────────────────
 
     async def _check_kill_switch(self):
-        """Compare current equity against starting equity; trigger if loss exceeds threshold."""
         try:
             loop = asyncio.get_running_loop()
             account = await loop.run_in_executor(
@@ -659,7 +779,6 @@ class ORBBot:
             await self._flatten_all_positions(reason="KILL_SWITCH")
 
     async def _flatten_all_positions(self, reason: str):
-        """Close all open positions and cancel open orders."""
         logger.warning("Flattening all positions — reason: %s", reason)
         try:
             loop = asyncio.get_running_loop()
@@ -671,7 +790,6 @@ class ORBBot:
         except Exception as exc:
             logger.error("Failed to flatten positions: %s", exc)
 
-        # Mark all IN_TRADE symbols as COMPLETED
         for state in self.states.values():
             async with state.lock:
                 if state.status == STATUS_IN_TRADE:
@@ -688,10 +806,12 @@ class ORBBot:
     # ── Background Tasks ───────────────────────────────────────────────────────
 
     async def _order_fill_monitor(self):
-        """Poll every 20s to sync bracket-order fill prices back to the DB.
+        """
+        Poll every 20s to sync bracket-order fill prices back to the DB.
 
-        Once the parent market order fills, record the actual entry price.
-        Once a child leg (TP or SL) fills, record exit price + close the trade.
+        Handles partial fills: if Alpaca only filled a portion of the requested qty,
+        we record the actual filled qty. Alpaca's bracket OCO legs are automatically
+        sized to the filled position, so no manual leg adjustment is needed.
         """
         while not self.kill_switch_triggered:
             await asyncio.sleep(20)
@@ -701,9 +821,11 @@ class ORBBot:
                 async with state.lock:
                     if state.status != STATUS_IN_TRADE or not state.order_id:
                         continue
-                    order_id = state.order_id
-                    trade_db_id = state.trade_db_id
-                    symbol = state.symbol
+                    order_id     = state.order_id
+                    trade_db_id  = state.trade_db_id
+                    symbol       = state.symbol
+                    prev_filled  = state.entry_qty_filled
+                    qty_requested = state.entry_qty_requested
 
                 try:
                     order = await loop.run_in_executor(
@@ -711,24 +833,39 @@ class ORBBot:
                         lambda oid=order_id: self.trading_client.get_order_by_id(oid),
                     )
 
-                    # Update fill price if not recorded yet
-                    if order.filled_avg_price:
-                        fill = round(float(order.filled_avg_price), 4)
+                    # ── Partial / full fill tracking ──────────────────────────
+                    filled_qty = int(float(order.filled_qty or 0))
+                    if filled_qty > 0 and filled_qty != prev_filled:
+                        update_kwargs: dict = {"status": "OPEN", "qty": filled_qty}
+                        if order.filled_avg_price:
+                            update_kwargs["entry_price"] = round(
+                                float(order.filled_avg_price), 4
+                            )
                         if trade_db_id:
-                            await self.db.update_trade(
-                                trade_db_id, entry_price=fill, status="OPEN"
+                            await self.db.update_trade(trade_db_id, **update_kwargs)
+
+                        async with state.lock:
+                            state.entry_qty_filled = filled_qty
+
+                        if 0 < filled_qty < qty_requested:
+                            logger.warning(
+                                "%s | PARTIAL FILL: %d/%d shares filled — "
+                                "bracket legs auto-adjusted by Alpaca",
+                                symbol, filled_qty, qty_requested,
+                            )
+                            await self.db.log_event(
+                                "PARTIAL_FILL",
+                                f"{symbol}: filled {filled_qty}/{qty_requested} shares",
                             )
 
-                    # Check if legs closed (bracket children)
+                    # ── Bracket leg fill check ────────────────────────────────
                     legs = getattr(order, "legs", None) or []
                     for leg in legs:
                         leg_status = str(getattr(leg, "status", "")).lower()
                         if leg_status == "filled":
                             exit_price = round(float(leg.filled_avg_price), 4)
-                            leg_side   = str(getattr(leg, "side", ""))
-                            # Determine reason from limit vs stop order type
                             order_type = str(getattr(leg, "order_type", "")).lower()
-                            reason = "CLOSED_TP" if "limit" in order_type else "CLOSED_SL"
+                            reason     = "CLOSED_TP" if "limit" in order_type else "CLOSED_SL"
 
                             if trade_db_id:
                                 await self.db.update_trade(
@@ -753,15 +890,149 @@ class ORBBot:
                 except Exception as exc:
                     logger.debug("Fill monitor error %s: %s", symbol, exc)
 
+    async def _orphan_order_cleanup(self):
+        """
+        Every 5 minutes: for each symbol we believe is IN_TRADE, verify a position
+        still exists on Alpaca. If the position is gone (manual close, external trigger,
+        or a prior disconnect), cancel any remaining open orders for that symbol and
+        mark the trade closed in the DB.
+        """
+        while not self.kill_switch_triggered:
+            await asyncio.sleep(300)
+            loop = asyncio.get_running_loop()
+
+            for symbol, state in self.states.items():
+                async with state.lock:
+                    if state.status != STATUS_IN_TRADE:
+                        continue
+                    trade_db_id = state.trade_db_id
+
+                try:
+                    # Check whether the position still exists
+                    try:
+                        await loop.run_in_executor(
+                            None,
+                            lambda s=symbol: self.trading_client.get_open_position(s),
+                        )
+                        continue  # position is alive — nothing to clean up
+                    except Exception:
+                        pass  # 404 or other error → position is gone
+
+                    # Position gone — cancel any lingering bracket legs
+                    all_orders = await loop.run_in_executor(
+                        None, self.trading_client.get_orders
+                    )
+                    cancelled = 0
+                    for order in all_orders:
+                        if str(order.symbol) != symbol:
+                            continue
+                        try:
+                            await loop.run_in_executor(
+                                None,
+                                lambda oid=str(order.id): self.trading_client.cancel_order_by_id(oid),
+                            )
+                            cancelled += 1
+                        except Exception:
+                            pass
+
+                    logger.warning(
+                        "%s | Orphan cleanup: position gone, cancelled %d open order(s)",
+                        symbol, cancelled,
+                    )
+                    await self.db.log_event(
+                        "ORPHAN_CANCEL",
+                        f"{symbol}: position closed externally, {cancelled} order(s) cancelled",
+                    )
+
+                    async with state.lock:
+                        state.status = STATUS_COMPLETED
+                        if trade_db_id:
+                            await self.db.update_trade(
+                                trade_db_id,
+                                status="CLOSED_MANUAL",
+                                closed_at=datetime.now(timezone.utc).isoformat(),
+                            )
+
+                except Exception as exc:
+                    logger.debug("Orphan cleanup error for %s: %s", symbol, exc)
+
+    async def _resync_from_rest(self):
+        """
+        Called after every stream reconnection. Cross-checks in-memory IN_TRADE
+        states against live Alpaca positions. If a position closed while we were
+        disconnected, marks it completed and updates the DB.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            positions    = await loop.run_in_executor(
+                None, self.trading_client.get_all_positions
+            )
+            open_symbols = {p.symbol for p in positions}
+        except Exception as exc:
+            logger.error("Post-reconnect resync failed: %s", exc)
+            return
+
+        for symbol, state in self.states.items():
+            async with state.lock:
+                if state.status != STATUS_IN_TRADE:
+                    continue
+                trade_db_id = state.trade_db_id
+
+                if symbol not in open_symbols:
+                    logger.warning(
+                        "%s | Position closed during disconnect — marking COMPLETED",
+                        symbol,
+                    )
+                    state.status = STATUS_COMPLETED
+                    if trade_db_id:
+                        await self.db.update_trade(
+                            trade_db_id,
+                            status="CLOSED_MANUAL",
+                            closed_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                    await self.db.log_event(
+                        "RESYNC",
+                        f"{symbol}: position closed during stream disconnect",
+                    )
+
+        logger.info("Post-reconnect resync complete. Open positions: %s", list(open_symbols))
+
+    async def _heartbeat_watchdog(self):
+        """
+        Logs a warning if no bar is received for > 3 minutes during market hours.
+        Does not force-reconnect (that is handled by _run_stream_with_reconnect);
+        this purely provides an observable signal in logs and the DB.
+        """
+        while not self.kill_switch_triggered:
+            await asyncio.sleep(90)
+            tz  = self.config.tz
+            now = datetime.now(tz)
+            mkt_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+            mkt_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+
+            if not (mkt_open <= now <= mkt_close):
+                continue
+            if self._last_bar_time == 0.0:
+                continue
+
+            elapsed = now.timestamp() - self._last_bar_time
+            if elapsed > 180:
+                logger.warning(
+                    "HEARTBEAT: no bar received in %.0fs during market hours",
+                    elapsed,
+                )
+                await self.db.log_event(
+                    "HEARTBEAT_WARN",
+                    f"No bar in {elapsed:.0f}s during market hours",
+                )
+
     async def _risk_monitor(self):
-        """Poll account equity every 60 seconds for the kill switch."""
         while not self.kill_switch_triggered:
             await asyncio.sleep(60)
             await self._check_kill_switch()
 
     async def _auto_flatten_scheduler(self):
-        """Block until 3:55 PM EST, then flatten all positions."""
-        tz = self.config.tz
+        tz  = self.config.tz
         now = datetime.now(tz)
         target = now.replace(
             hour=self.config.flatten_hour,
@@ -770,16 +1041,60 @@ class ORBBot:
             microsecond=0,
         )
         if now >= target:
-            # Already past today's flatten time; schedule for next trading day
             target += timedelta(days=1)
 
         wait = (target - now).total_seconds()
-        logger.info("Auto-flatten scheduled in %.0f seconds (%s EST)", wait, target.strftime("%H:%M"))
+        logger.info(
+            "Auto-flatten scheduled in %.0f seconds (%s EST)",
+            wait, target.strftime("%H:%M"),
+        )
         await asyncio.sleep(wait)
 
         if not self.kill_switch_triggered:
             logger.info("Auto-flatten triggered (3:55 PM EST)")
             await self._flatten_all_positions(reason="AUTO_FLATTEN_3:55PM")
+
+    # ── Stream with Reconnection ───────────────────────────────────────────────
+
+    async def _run_stream_with_reconnect(self):
+        """
+        Run the WebSocket stream inside an exponential-backoff retry loop.
+        On each reconnection: resync in-memory state from the REST API before
+        resuming bar processing.
+        """
+        backoff     = 1
+        max_backoff = 60
+
+        while not self.kill_switch_triggered:
+            try:
+                logger.info("Connecting to Alpaca data stream…")
+                await self.stream._run_forever()
+                # _run_forever() returned without error — treat as silent disconnect
+                logger.warning("Stream ended without exception — reconnecting…")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Stream error: %s", exc)
+
+            if self.kill_switch_triggered:
+                break
+
+            logger.info("Reconnecting in %ds…", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+            # Recreate the stream — the old connection is dead
+            async with self._stream_reconnect_lock:
+                self.stream = StockDataStream(
+                    api_key=self.config.api_key,
+                    secret_key=self.config.api_secret,
+                    feed=self.config.data_feed,
+                )
+                self.stream.subscribe_bars(self.on_bar, *self.config.symbols)
+
+            # Resync before we start receiving bars again
+            await self._resync_from_rest()
+            backoff = 1  # reset after a successful reconnect attempt
 
     # ── Entry Point ────────────────────────────────────────────────────────────
 
@@ -791,18 +1106,18 @@ class ORBBot:
         await self._fetch_starting_equity()
         await self.db.log_event("START", f"symbols={self.config.symbols}")
 
-        # Subscribe to 1-minute bars for all symbols
+        # Restore any trades that were open when the bot last stopped
+        await self._resume_from_db()
+
         self.stream.subscribe_bars(self.on_bar, *self.config.symbols)
 
-        # Launch background tasks
         asyncio.create_task(self._risk_monitor())
         asyncio.create_task(self._auto_flatten_scheduler())
         asyncio.create_task(self._order_fill_monitor())
+        asyncio.create_task(self._orphan_order_cleanup())
+        asyncio.create_task(self._heartbeat_watchdog())
 
-        logger.info("Connecting to Alpaca data stream…")
-        # Use _run_forever() directly — stream.run() calls asyncio.run() internally
-        # which conflicts with our already-running event loop.
-        await self.stream._run_forever()
+        await self._run_stream_with_reconnect()
 
 
 # ── Graceful Shutdown ──────────────────────────────────────────────────────────
@@ -816,7 +1131,7 @@ async def _shutdown(bot: ORBBot):
 
 def main():
     config = Config()
-    bot = ORBBot(config)
+    bot    = ORBBot(config)
 
     import signal as _signal
 

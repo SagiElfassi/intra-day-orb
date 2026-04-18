@@ -887,7 +887,7 @@ with tab_bt:
 
         # Human-readable columns
         display["#"]       = range(1, len(display) + 1)
-        display["Result"]  = display["exit_reason"].map({"TP": "✅ TP", "SL": "❌ SL", "FLAT": "🕐 3:55 Flat"})
+        display["Result"]  = display["exit_reason"].map({"TP": "✅ TP", "SL": "❌ SL", "EOD": "🕐 3:55 EOD"})
         display["Side"]    = display["side"].map({"LONG": "▲ LONG", "SHORT": "▼ SHORT"})
         display["PnL"]     = display["pnl"].map(lambda x: f"+${x:.2f}" if x >= 0 else f"-${abs(x):.2f}")
         display["R"]       = display["r_multiple"].map(lambda x: f"+{x:.2f}R" if x >= 0 else f"{x:.2f}R")

@@ -5,6 +5,7 @@ using the exact same logic as bot.py.
 """
 
 import math
+import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import List, Optional
@@ -54,6 +55,9 @@ class BacktestStats:
     worst_trade: float = 0.0
     days_with_signal: int = 0
     days_skipped_no_data: int = 0
+    expectancy: float = 0.0       # (win% * avg_win) - (loss% * |avg_loss|)
+    recovery_factor: float = 0.0  # total_pnl / max_drawdown
+    sharpe_ratio: float = 0.0     # mean(pnl) / std(pnl), trade-based
 
 
 @dataclass
@@ -85,7 +89,7 @@ class BacktestEngine:
 
     # ── Data Fetch ─────────────────────────────────────────────────────────────
 
-    def fetch_bars(self, symbol: str, start: date, end: date) -> pd.DataFrame:
+    def fetch_bars(self, symbol: str, start: date, end: date, feed: DataFeed = DataFeed.IEX) -> pd.DataFrame:
         """Download 1-minute bars for the given date range."""
         start_dt = datetime(start.year, start.month, start.day, 4, 0, tzinfo=EST)
         end_dt   = datetime(end.year,   end.month,   end.day,   23, 59, tzinfo=EST)
@@ -95,7 +99,7 @@ class BacktestEngine:
             timeframe=TimeFrame(1, TimeFrameUnit.Minute),
             start=start_dt,
             end=end_dt,
-            feed=DataFeed.IEX,
+            feed=feed,
         )
         raw = self.client.get_stock_bars(request)
         df  = raw.df
@@ -125,6 +129,8 @@ class BacktestEngine:
         stop_loss_type: str = "midpoint",
         min_bars_required: int = 13,
         position_size_usd: float = 1000.0,
+        slippage_bps: float = 0.0,
+        feed: DataFeed = DataFeed.IEX,
     ) -> BacktestResult:
 
         result = BacktestResult(
@@ -138,7 +144,7 @@ class BacktestEngine:
         )
 
         try:
-            df = self.fetch_bars(symbol, start_date, end_date)
+            df = self.fetch_bars(symbol, start_date, end_date, feed=feed)
         except Exception as exc:
             result.error = str(exc)
             return result
@@ -198,7 +204,12 @@ class BacktestEngine:
                 else:
                     continue  # no breakout yet
 
-                entry_price = close
+                slip = round(close * slippage_bps / 10_000, 2)
+                if side == "LONG":
+                    entry_price = round(close + slip, 2)
+                else:
+                    entry_price = round(close - slip, 2)
+
                 qty = max(1, math.floor(position_size_usd / entry_price))
 
                 if side == "LONG":
@@ -213,38 +224,43 @@ class BacktestEngine:
                     break
 
                 # --- Simulate bar-by-bar until TP/SL/EOD ---
+                # after_entry starts at i+1 to avoid look-ahead bias on the entry bar
                 after_entry = scan_bars.iloc[i + 1:]
                 exit_price  = entry_price
-                exit_reason = "FLAT"   # 3:55 PM flatten — TP/SL not reached
+                exit_reason = "EOD"
                 exit_time   = bar["timestamp"]
 
                 for _, ex in after_entry.iterrows():
                     if side == "LONG":
                         if ex["high"] >= tp:
-                            exit_price  = tp
+                            exit_price  = round(tp - slip, 2)
                             exit_reason = "TP"
                             exit_time   = ex["timestamp"]
                             break
                         if ex["low"] <= sl:
-                            exit_price  = sl
+                            exit_price  = round(sl - slip, 2)
                             exit_reason = "SL"
                             exit_time   = ex["timestamp"]
                             break
                     else:
                         if ex["low"] <= tp:
-                            exit_price  = tp
+                            exit_price  = round(tp + slip, 2)
                             exit_reason = "TP"
                             exit_time   = ex["timestamp"]
                             break
                         if ex["high"] >= sl:
-                            exit_price  = sl
+                            exit_price  = round(sl + slip, 2)
                             exit_reason = "SL"
                             exit_time   = ex["timestamp"]
                             break
                 else:
                     if not after_entry.empty:
-                        exit_price = after_entry.iloc[-1]["close"]
-                        exit_time  = after_entry.iloc[-1]["timestamp"]
+                        eod_close = after_entry.iloc[-1]["close"]
+                        if side == "LONG":
+                            exit_price = round(eod_close - slip, 2)
+                        else:
+                            exit_price = round(eod_close + slip, 2)
+                        exit_time = after_entry.iloc[-1]["timestamp"]
 
                 raw_pnl = (
                     (exit_price - entry_price) if side == "LONG"
@@ -310,14 +326,25 @@ def _compute_stats(trades: List[BacktestTrade], days_skipped: int = 0) -> Backte
         if dd > max_dd:
             max_dd = dd
 
+    win_pct  = len(wins)   / len(trades)
+    loss_pct = len(losses) / len(trades)
+    avg_win_val  = sum(wins)   / len(wins)   if wins   else 0.0
+    avg_loss_val = sum(losses) / len(losses) if losses else 0.0  # negative
+
+    expectancy      = round(win_pct * avg_win_val + loss_pct * avg_loss_val, 2)
+    recovery_factor = round(sum(pnls) / max_dd, 2) if max_dd > 0 else float("inf")
+    sharpe          = round(
+        (sum(pnls) / len(pnls)) / statistics.stdev(pnls), 2
+    ) if len(pnls) >= 2 and statistics.stdev(pnls) > 0 else 0.0
+
     return BacktestStats(
         total_trades          = len(trades),
         winning_trades        = len(wins),
         losing_trades         = len(losses),
-        win_rate              = round(len(wins) / len(trades) * 100, 1),
+        win_rate              = round(win_pct * 100, 1),
         total_pnl             = round(sum(pnls), 2),
-        avg_win               = round(sum(wins)   / len(wins),   2) if wins   else 0.0,
-        avg_loss              = round(sum(losses)  / len(losses), 2) if losses else 0.0,
+        avg_win               = round(avg_win_val,  2),
+        avg_loss              = round(avg_loss_val, 2),
         profit_factor         = round(gross_profit / gross_loss,  2) if gross_loss else float("inf"),
         max_drawdown          = round(max_dd, 2),
         avg_r_multiple        = round(sum(t.r_multiple for t in trades) / len(trades), 2),
@@ -325,6 +352,9 @@ def _compute_stats(trades: List[BacktestTrade], days_skipped: int = 0) -> Backte
         worst_trade           = round(min(pnls), 2),
         days_with_signal      = len(trades),
         days_skipped_no_data  = days_skipped,
+        expectancy            = expectancy,
+        recovery_factor       = recovery_factor,
+        sharpe_ratio          = sharpe,
     )
 
 

@@ -543,13 +543,18 @@ def build_r_distribution(trades_df: pd.DataFrame) -> go.Figure:
 
 
 def build_bt_day_chart(trade_row: pd.Series, day_bars: pd.DataFrame) -> go.Figure:
-    """Mini chart for a single backtest trade showing the ORB box + entry/exit."""
+    """Backtest day chart: candlestick + ORB box + VWAP + TP1/TP2/SL levels + exit markers."""
     fig = go.Figure()
     if day_bars.empty:
         _dark_layout(fig)
         return fig
 
-    day_bars = trading_hours(day_bars)
+    day_bars = trading_hours(day_bars).copy()
+
+    # ── VWAP (running from first bar, same formula as bot.py / backtest.py) ──
+    typ_px  = (day_bars["high"] + day_bars["low"] + day_bars["close"]) / 3
+    cum_vol = day_bars["volume"].cumsum()
+    day_bars["_vwap"] = (typ_px * day_bars["volume"]).cumsum() / cum_vol.replace(0, float("nan"))
 
     fig.add_trace(go.Candlestick(
         x=day_bars["timestamp"],
@@ -557,6 +562,14 @@ def build_bt_day_chart(trade_row: pd.Series, day_bars: pd.DataFrame) -> go.Figur
         low=day_bars["low"],   close=day_bars["close"],
         increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
         name="Price",
+    ))
+
+    # VWAP line
+    fig.add_trace(go.Scatter(
+        x=day_bars["timestamp"], y=day_bars["_vwap"],
+        mode="lines", line=dict(color="#FF6F00", width=1.5, dash="dot"),
+        name="VWAP",
+        hovertemplate="%{x|%H:%M}<br>VWAP: $%{y:.2f}<extra></extra>",
     ))
 
     x0, x1 = day_bars["timestamp"].iloc[0], day_bars["timestamp"].iloc[-1]
@@ -568,40 +581,88 @@ def build_bt_day_chart(trade_row: pd.Series, day_bars: pd.DataFrame) -> go.Figur
                   line=dict(color="rgba(255,214,0,.5)", width=1))
 
     # 3:55 PM flatten line
-    entry_ts = pd.to_datetime(trade_row["entry_time"])
+    entry_ts   = pd.to_datetime(trade_row["entry_time"])
     flatten_ts = entry_ts.normalize().replace(hour=15, minute=55)
     fig.add_vline(x=flatten_ts.timestamp() * 1000,
-                  line_dash="dot", line_color="#FF6F00", line_width=1.5,
+                  line_dash="dot", line_color="#546e7a", line_width=1,
                   annotation_text="3:55 Flatten", annotation_position="top right",
-                  annotation_font_color="#FF6F00")
+                  annotation_font_color="#546e7a")
 
-    # TP / SL / Entry
+    # ── TP / SL / Entry levels ────────────────────────────────────────────────
+    tp1_px  = trade_row.get("tp1_price", 0.0) or 0.0
+    tp2_px  = trade_row.get("tp2_price", 0.0) or 0.0
+    entry   = trade_row["entry_price"]
+    sl      = trade_row["stop_loss"]
+    scale_out_trade = tp1_px > 0 and tp2_px > 0 and abs(tp1_px - tp2_px) > 0.001
+
+    # Entry + SL (always present)
+    fig.add_hline(y=entry, line_dash="solid", line_color="#82b1ff", line_width=1.5,
+                  annotation_text=f"Entry  {entry:.2f}", annotation_position="right",
+                  annotation_font_color="#82b1ff")
+    fig.add_hline(y=sl, line_dash="dash", line_color="#ef5350", line_width=1.5,
+                  annotation_text=f"SL  {sl:.2f}", annotation_position="right",
+                  annotation_font_color="#ef5350")
+
+    if scale_out_trade:
+        fig.add_hline(y=tp1_px, line_dash="dash", line_color="#69f0ae", line_width=1.5,
+                      annotation_text=f"TP1  {tp1_px:.2f}", annotation_position="right",
+                      annotation_font_color="#69f0ae")
+        fig.add_hline(y=tp2_px, line_dash="dash", line_color="#00e676", line_width=2,
+                      annotation_text=f"TP2  {tp2_px:.2f}", annotation_position="right",
+                      annotation_font_color="#00e676")
+        # Break-even level (= entry, shown as a note after TP1)
+        fig.add_annotation(x=1.01, xref="paper", y=entry,
+                           text="B/E after TP1", showarrow=False,
+                           xanchor="left", yanchor="bottom",
+                           font=dict(size=9, color="#82b1ff"))
+    else:
+        tp_px = tp2_px if tp2_px > 0 else trade_row.get("take_profit", 0.0)
+        if tp_px:
+            fig.add_hline(y=tp_px, line_dash="dash", line_color="#00e676", line_width=1.5,
+                          annotation_text=f"TP  {tp_px:.2f}", annotation_position="right",
+                          annotation_font_color="#00e676")
+
+    # ── Exit markers ─────────────────────────────────────────────────────────
+    _exit_colors = {
+        "TP": "#00e676", "TP1": "#69f0ae", "TP2": "#00e676",
+        "SL": "#ef5350", "BE": "#82b1ff",  "EOD": "#FF6F00",
+    }
     exit_reason = trade_row.get("exit_reason", "")
-    for level, label, color in [
-        (trade_row["take_profit"], f"TP  {trade_row['take_profit']:.2f}", "#00e676"),
-        (trade_row["stop_loss"],   f"SL  {trade_row['stop_loss']:.2f}",   "#ef5350"),
-        (trade_row["entry_price"], f"Entry  {trade_row['entry_price']:.2f}", "#82b1ff"),
-    ]:
-        fig.add_hline(y=level, line_dash="dash", line_color=color,
-                      annotation_text=label, annotation_position="right")
+    leg1_reason = trade_row.get("leg1_exit", "")
 
-    # Exit marker
+    # Leg 1 exit marker (only in scale-out mode when TP1 was hit)
+    if scale_out_trade and leg1_reason == "TP1":
+        try:
+            fig.add_trace(go.Scatter(
+                x=[entry_ts], y=[tp1_px],
+                mode="markers",
+                marker=dict(symbol="circle", size=10,
+                            color="#69f0ae", line=dict(color="#fff", width=1)),
+                name="TP1 hit",
+                hovertemplate="TP1 hit<br>$%{y:.2f}<extra></extra>",
+            ))
+        except Exception:
+            pass
+
+    # Final exit marker
     if pd.notna(trade_row.get("exit_time")) and pd.notna(trade_row.get("exit_price")):
         try:
-            exit_ts = pd.to_datetime(trade_row["exit_time"])
-            exit_color = "#00e676" if exit_reason == "TP" else ("#ef5350" if exit_reason == "SL" else "#FF6F00")
+            final_ts    = pd.to_datetime(trade_row["exit_time"])
+            final_color = _exit_colors.get(exit_reason, "#FF6F00")
             fig.add_trace(go.Scatter(
-                x=[exit_ts], y=[trade_row["exit_price"]],
+                x=[final_ts], y=[float(trade_row["exit_price"])],
                 mode="markers",
-                marker=dict(symbol="x", size=12, color=exit_color, line_width=2),
+                marker=dict(symbol="x", size=12, color=final_color, line_width=2),
                 name=f"Exit ({exit_reason})",
+                hovertemplate=f"Exit: {exit_reason}<br>$%{{y:.2f}}<extra></extra>",
             ))
         except Exception:
             pass
 
     fig.update_layout(
-        xaxis_rangeslider_visible=False, height=380,
-        margin=dict(l=0, r=90, t=10, b=0),
+        xaxis_rangeslider_visible=False, height=420,
+        margin=dict(l=0, r=120, t=10, b=0),
+        legend=dict(orientation="h", y=1.06, x=0, font=dict(size=11)),
     )
     _dark_layout(fig)
     apply_rangebreaks(fig, rows=1)

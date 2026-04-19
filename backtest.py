@@ -33,17 +33,22 @@ class BacktestTrade:
     side: str           # LONG | SHORT
     entry_time: str
     entry_price: float
-    take_profit: float
+    take_profit: float  # = tp2 in scale-out mode, = tp in single-leg
     stop_loss: float
     range_high: float
     range_low: float
-    exit_time: str
-    exit_price: float
-    exit_reason: str    # TP | SL | EOD
-    qty: int
-    fees: float         # SEC + FINRA TAF regulatory fees
-    pnl: float          # net of fees
-    r_multiple: float   # price-based (pre-fee) for trade quality assessment
+    exit_time: str      # time of the final (last) exit
+    exit_price: float   # weighted avg of both legs in scale-out mode
+    exit_reason: str    # TP / TP2 / BE / SL / EOD
+    qty: int            # total quantity across all legs
+    fees: float         # SEC + FINRA TAF regulatory fees (all legs combined)
+    pnl: float          # net of fees (all legs combined)
+    r_multiple: float   # net R = pnl / (risk_per_share × total_qty)
+    # Two-leg extras — 0.0 / "" in single-leg mode
+    tp1_price: float = 0.0
+    tp2_price: float = 0.0
+    leg1_exit_reason: str = ""   # TP1 | SL | EOD
+    leg1_pnl: float = 0.0
 
 
 @dataclass
@@ -84,6 +89,9 @@ class BacktestResult:
     risk_ratio: float
     stop_loss_type: str
     position_size_usd: float
+    tp1_r: float = 0.0
+    tp2_r: float = 0.0
+    risk_pct_equity: float = 0.0
     trades: List[BacktestTrade] = field(default_factory=list)
     skipped_days: List[SkippedDay] = field(default_factory=list)
     stats: BacktestStats = field(default_factory=BacktestStats)
@@ -166,6 +174,11 @@ class BacktestEngine:
         position_size_usd: float = 1000.0,
         slippage_bps: float = 0.0,
         feed: DataFeed = DataFeed.IEX,
+        # Dynamic Momentum params (0 = disabled → classic single-leg mode)
+        tp1_r: float = 0.0,
+        tp2_r: float = 0.0,
+        risk_pct_equity: float = 0.0,
+        starting_equity: float = 100_000.0,
     ) -> BacktestResult:
 
         result = BacktestResult(
@@ -176,6 +189,9 @@ class BacktestEngine:
             risk_ratio=risk_ratio,
             stop_loss_type=stop_loss_type,
             position_size_usd=position_size_usd,
+            tp1_r=tp1_r,
+            tp2_r=tp2_r,
+            risk_pct_equity=risk_pct_equity,
         )
 
         try:
@@ -281,16 +297,12 @@ class BacktestEngine:
             entry_bar = scan_bars.iloc[entry_iloc]
             close     = float(entry_bar["close"])
 
-            slip = round(close * slippage_bps / 10_000, 2)
+            slip        = round(close * slippage_bps / 10_000, 2)
             entry_price = round(close + slip, 2) if side == "LONG" else round(close - slip, 2)
 
-            qty = max(1, math.floor(position_size_usd / entry_price))
-
             if side == "LONG":
-                tp = round(entry_price + rng_span * risk_ratio, 2)
                 sl = round(rng_mid if stop_loss_type == "midpoint" else rng_low,  2)
             else:
-                tp = round(entry_price - rng_span * risk_ratio, 2)
                 sl = round(rng_mid if stop_loss_type == "midpoint" else rng_high, 2)
 
             risk_per_share = abs(entry_price - sl)
@@ -301,72 +313,210 @@ class BacktestEngine:
                 ))
                 continue
 
-            # ── Exit: vectorized TP/SL search ──────────────────────────────────
-            # after_entry starts at entry_iloc+1 to avoid look-ahead bias.
+            # ── Two-leg scale-out mode when tp1_r and tp2_r are set ────────────
+            scale_out = tp1_r > 0 and tp2_r > tp1_r
+
+            # Sizing: volatility-adjusted (risk % of equity) or fixed USD
+            if risk_pct_equity > 0:
+                risk_dollar = starting_equity * risk_pct_equity / 100.0
+                total_qty   = max(2, math.floor(risk_dollar / risk_per_share))
+            else:
+                total_qty   = max(1, math.floor(position_size_usd / entry_price))
+
+            half_qty = total_qty // 2
+            rem_qty  = total_qty - half_qty
+
+            # Target prices
+            if scale_out:
+                if side == "LONG":
+                    tp1_px = round(entry_price + risk_per_share * tp1_r, 2)
+                    tp2_px = round(entry_price + risk_per_share * tp2_r, 2)
+                else:
+                    tp1_px = round(entry_price - risk_per_share * tp1_r, 2)
+                    tp2_px = round(entry_price - risk_per_share * tp2_r, 2)
+            else:
+                # Classic mode: single TP based on ORB span × risk_ratio
+                if side == "LONG":
+                    tp1_px = tp2_px = round(entry_price + rng_span * risk_ratio, 2)
+                else:
+                    tp1_px = tp2_px = round(entry_price - rng_span * risk_ratio, 2)
+
+            # Fee helper (regulatory pass-through, sell side only)
+            def _fee(q: int, sell_px: float) -> float:
+                return round(
+                    sell_px * q * _SEC_FEE_PER_DOLLAR
+                    + min(q * _FINRA_TAF_PER_SHARE, _FINRA_TAF_CAP),
+                    4,
+                )
+
+            # ── Exit: after_entry starts at entry_iloc+1 to avoid look-ahead ──
             after_entry = scan_bars.iloc[entry_iloc + 1:]
 
-            if after_entry.empty:
-                # Entered on the last scan bar — exit at EOD close
-                eod_close = float(entry_bar["close"])
-                exit_price  = round(eod_close - slip, 2) if side == "LONG" else round(eod_close + slip, 2)
-                exit_reason = "EOD"
-                exit_time   = entry_bar["timestamp"]
-            else:
-                if side == "LONG":
-                    tp_hit = after_entry["high"].values >= tp
-                    sl_hit = after_entry["low"].values  <= sl
-                else:
-                    tp_hit = after_entry["low"].values  <= tp
-                    sl_hit = after_entry["high"].values >= sl
-
-                tp_iloc_a = int(tp_hit.argmax()) if tp_hit.any() else len(after_entry)
-                sl_iloc_a = int(sl_hit.argmax()) if sl_hit.any() else len(after_entry)
-
-                if tp_hit.any() and tp_iloc_a <= sl_iloc_a:
-                    # TP hit first (or same bar as SL — TP takes priority)
-                    exit_reason = "TP"
-                    exit_row    = after_entry.iloc[tp_iloc_a]
-                    exit_price  = round(tp - slip, 2) if side == "LONG" else round(tp + slip, 2)
-                elif sl_hit.any():
-                    exit_reason = "SL"
-                    exit_row    = after_entry.iloc[sl_iloc_a]
-                    exit_price  = round(sl - slip, 2) if side == "LONG" else round(sl + slip, 2)
-                else:
+            if not scale_out:
+                # ── Single-leg (classic ORB) ──────────────────────────────────
+                if after_entry.empty:
+                    eod_close   = float(entry_bar["close"])
+                    exit_px     = round(eod_close - slip, 2) if side == "LONG" else round(eod_close + slip, 2)
                     exit_reason = "EOD"
-                    exit_row    = after_entry.iloc[-1]
-                    eod_close   = float(exit_row["close"])
-                    exit_price  = round(eod_close - slip, 2) if side == "LONG" else round(eod_close + slip, 2)
+                    exit_ts     = entry_bar["timestamp"]
+                else:
+                    if side == "LONG":
+                        tp_hit = after_entry["high"].values >= tp1_px
+                        sl_hit = after_entry["low"].values  <= sl
+                    else:
+                        tp_hit = after_entry["low"].values  <= tp1_px
+                        sl_hit = after_entry["high"].values >= sl
 
-                exit_time = exit_row["timestamp"]
+                    tp_i = int(tp_hit.argmax()) if tp_hit.any() else len(after_entry)
+                    sl_i = int(sl_hit.argmax()) if sl_hit.any() else len(after_entry)
 
-            # ── Regulatory fees (sell side only) ───────────────────────────────
-            # LONG: sell happens at exit. SHORT: sell-to-open happens at entry.
-            sell_principal = (exit_price if side == "LONG" else entry_price) * qty
-            sec_fee        = sell_principal * _SEC_FEE_PER_DOLLAR
-            finra_fee      = min(qty * _FINRA_TAF_PER_SHARE, _FINRA_TAF_CAP)
-            fees           = round(sec_fee + finra_fee, 4)
+                    if tp_hit.any() and tp_i <= sl_i:
+                        exit_reason = "TP"
+                        exit_row    = after_entry.iloc[tp_i]
+                        exit_px     = round(tp1_px - slip, 2) if side == "LONG" else round(tp1_px + slip, 2)
+                    elif sl_hit.any():
+                        exit_reason = "SL"
+                        exit_row    = after_entry.iloc[sl_i]
+                        exit_px     = round(sl - slip, 2) if side == "LONG" else round(sl + slip, 2)
+                    else:
+                        exit_reason = "EOD"
+                        exit_row    = after_entry.iloc[-1]
+                        eod_close   = float(exit_row["close"])
+                        exit_px     = round(eod_close - slip, 2) if side == "LONG" else round(eod_close + slip, 2)
+                    exit_ts = exit_row["timestamp"]
 
-            raw_pnl    = (exit_price - entry_price) if side == "LONG" else (entry_price - exit_price)
-            pnl        = round(raw_pnl * qty - fees, 2)
-            r_multiple = round(raw_pnl / risk_per_share, 2)  # price-based, pre-fee
+                sell_px  = exit_px if side == "LONG" else entry_price
+                fees     = _fee(total_qty, sell_px)
+                raw_pnl  = (exit_px - entry_price) if side == "LONG" else (entry_price - exit_px)
+                pnl      = round(raw_pnl * total_qty - fees, 2)
+                r_mult   = round(raw_pnl / risk_per_share, 2)
+                tp1_out  = tp1_px
+                tp2_out  = tp1_px
+                l1_reason = exit_reason
+                l1_pnl   = pnl
+
+            else:
+                # ── Two-leg scale-out ─────────────────────────────────────────
+                # Phase 1: find TP1 or SL
+                if after_entry.empty:
+                    eod_close = float(entry_bar["close"])
+                    l1_px     = round(eod_close - slip, 2) if side == "LONG" else round(eod_close + slip, 2)
+                    l1_reason = "EOD"
+                    l1_idx    = None
+                    l1_ts     = entry_bar["timestamp"]
+                else:
+                    if side == "LONG":
+                        tp1_hit = after_entry["high"].values >= tp1_px
+                        sl_hit  = after_entry["low"].values  <= sl
+                    else:
+                        tp1_hit = after_entry["low"].values  <= tp1_px
+                        sl_hit  = after_entry["high"].values >= sl
+
+                    tp1_i = int(tp1_hit.argmax()) if tp1_hit.any() else len(after_entry)
+                    sl_i  = int(sl_hit.argmax())  if sl_hit.any()  else len(after_entry)
+
+                    if tp1_hit.any() and tp1_i <= sl_i:
+                        l1_reason = "TP1"
+                        l1_row    = after_entry.iloc[tp1_i]
+                        l1_px     = round(tp1_px - slip, 2) if side == "LONG" else round(tp1_px + slip, 2)
+                        l1_idx    = tp1_i
+                        l1_ts     = l1_row["timestamp"]
+                    elif sl_hit.any():
+                        l1_reason = "SL"
+                        l1_row    = after_entry.iloc[sl_i]
+                        l1_px     = round(sl - slip, 2) if side == "LONG" else round(sl + slip, 2)
+                        l1_idx    = sl_i
+                        l1_ts     = l1_row["timestamp"]
+                    else:
+                        l1_reason = "EOD"
+                        l1_row    = after_entry.iloc[-1]
+                        eod_close = float(l1_row["close"])
+                        l1_px     = round(eod_close - slip, 2) if side == "LONG" else round(eod_close + slip, 2)
+                        l1_idx    = None
+                        l1_ts     = l1_row["timestamp"]
+
+                fees1  = _fee(half_qty, l1_px if side == "LONG" else entry_price)
+                raw1   = (l1_px - entry_price) if side == "LONG" else (entry_price - l1_px)
+                l1_pnl = round(raw1 * half_qty - fees1, 2)
+
+                # Phase 2: if TP1 hit → scan with break-even SL; else both legs closed at l1
+                if l1_reason in ("SL", "EOD"):
+                    raw2      = raw1
+                    l2_px     = l1_px
+                    l2_reason = l1_reason
+                    final_ts  = l1_ts
+                    fees2     = _fee(rem_qty, l2_px if side == "LONG" else entry_price)
+                else:
+                    be_sl     = entry_price  # SL moves to break-even after TP1
+                    after_tp1 = after_entry.iloc[l1_idx + 1:] if l1_idx is not None else pd.DataFrame()
+
+                    if after_tp1.empty:
+                        eod_close = float(l1_row["close"])
+                        l2_px     = round(eod_close - slip, 2) if side == "LONG" else round(eod_close + slip, 2)
+                        l2_reason = "EOD"
+                        final_ts  = l1_ts
+                    else:
+                        if side == "LONG":
+                            tp2_hit = after_tp1["high"].values >= tp2_px
+                            be_hit  = after_tp1["low"].values  <= be_sl
+                        else:
+                            tp2_hit = after_tp1["low"].values  <= tp2_px
+                            be_hit  = after_tp1["high"].values >= be_sl
+
+                        tp2_i = int(tp2_hit.argmax()) if tp2_hit.any() else len(after_tp1)
+                        be_i  = int(be_hit.argmax())  if be_hit.any()  else len(after_tp1)
+
+                        if tp2_hit.any() and tp2_i <= be_i:
+                            l2_reason = "TP2"
+                            l2_row    = after_tp1.iloc[tp2_i]
+                            l2_px     = round(tp2_px - slip, 2) if side == "LONG" else round(tp2_px + slip, 2)
+                            final_ts  = l2_row["timestamp"]
+                        elif be_hit.any():
+                            l2_reason = "BE"
+                            l2_row    = after_tp1.iloc[be_i]
+                            l2_px     = round(be_sl - slip, 2) if side == "LONG" else round(be_sl + slip, 2)
+                            final_ts  = l2_row["timestamp"]
+                        else:
+                            l2_reason = "EOD"
+                            l2_row    = after_tp1.iloc[-1]
+                            eod_close = float(l2_row["close"])
+                            l2_px     = round(eod_close - slip, 2) if side == "LONG" else round(eod_close + slip, 2)
+                            final_ts  = l2_row["timestamp"]
+
+                    fees2 = _fee(rem_qty, l2_px if side == "LONG" else entry_price)
+                    raw2  = (l2_px - entry_price) if side == "LONG" else (entry_price - l2_px)
+
+                l2_pnl   = round(raw2 * rem_qty - fees2, 2)
+                fees     = round(fees1 + fees2, 4)
+                pnl      = round(l1_pnl + l2_pnl, 2)
+                exit_px  = round((l1_px * half_qty + l2_px * rem_qty) / total_qty, 4)
+                exit_ts  = final_ts
+                exit_reason = l2_reason
+                r_mult   = round(pnl / (risk_per_share * total_qty), 2) if risk_per_share * total_qty > 0 else 0.0
+                tp1_out  = tp1_px
+                tp2_out  = tp2_px
 
             result.trades.append(BacktestTrade(
-                date        = date_str,
-                symbol      = symbol,
-                side        = side,
-                entry_time  = str(entry_bar["timestamp"]),
-                entry_price = entry_price,
-                take_profit = tp,
-                stop_loss   = sl,
-                range_high  = round(rng_high, 2),
-                range_low   = round(rng_low,  2),
-                exit_time   = str(exit_time),
-                exit_price  = exit_price,
-                exit_reason = exit_reason,
-                qty         = qty,
-                fees        = fees,
-                pnl         = pnl,
-                r_multiple  = r_multiple,
+                date             = date_str,
+                symbol           = symbol,
+                side             = side,
+                entry_time       = str(entry_bar["timestamp"]),
+                entry_price      = entry_price,
+                take_profit      = tp2_out,
+                stop_loss        = sl,
+                range_high       = round(rng_high, 2),
+                range_low        = round(rng_low,  2),
+                exit_time        = str(exit_ts),
+                exit_price       = round(exit_px, 2),
+                exit_reason      = exit_reason,
+                qty              = total_qty,
+                fees             = fees,
+                pnl              = pnl,
+                r_multiple       = r_mult,
+                tp1_price        = tp1_out,
+                tp2_price        = tp2_out,
+                leg1_exit_reason = l1_reason if scale_out else "",
+                leg1_pnl         = l1_pnl    if scale_out else 0.0,
             ))
 
         result.stats        = _compute_stats(result.trades, len(result.skipped_days))

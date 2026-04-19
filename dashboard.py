@@ -836,23 +836,48 @@ with tab_live:
 with tab_bt:
     st.subheader("Backtest Parameters")
 
-    bc1, bc2, bc3 = st.columns(3)
+    bc1, bc2, bc3, bc4 = st.columns(4)
     with bc1:
-        bt_symbol    = st.text_input("Symbol", value=symbols[0] if symbols else "SPY").upper()
-        bt_orb       = st.radio("ORB Timeframe ", [5, 15, 30],
-                                index=[5, 15, 30].index(orb_minutes),
-                                format_func=lambda x: f"{x} min", horizontal=True,
-                                key="bt_orb")
+        bt_symbol  = st.text_input("Symbol", value=symbols[0] if symbols else "SPY").upper()
+        bt_orb     = st.radio("ORB Timeframe ", [5, 15, 30],
+                              index=[5, 15, 30].index(orb_minutes),
+                              format_func=lambda x: f"{x} min", horizontal=True,
+                              key="bt_orb")
+        bt_sl_type = st.radio("Stop-Loss", ["midpoint", "hard"],
+                              index=0 if sl_type == "midpoint" else 1,
+                              horizontal=True, key="bt_sl")
     with bc2:
         bt_start = st.date_input("Start Date", value=date.today() - timedelta(days=90), key="bt_start")
         bt_end   = st.date_input("End Date",   value=date.today() - timedelta(days=1),  key="bt_end")
+        bt_slippage = st.number_input("Slippage (bps)", 0.0, 50.0, 0.0, 0.5, format="%.1f", key="bt_slip")
     with bc3:
-        bt_rr      = st.slider("Risk:Reward", 1.0, 5.0, risk_ratio, 0.5, key="bt_rr")
-        bt_sl_type = st.radio("Stop-Loss",  ["midpoint", "hard"],
-                              index=0 if sl_type == "midpoint" else 1,
-                              horizontal=True, key="bt_sl")
-        bt_pos     = st.number_input("Position Size (USD)", 100, 100000,
-                                     int(pos_size), 100, key="bt_pos")
+        bt_scale_out = st.toggle("Two-Leg Scale-Out", value=True, key="bt_scale_out",
+                                  help="Simulate TP1+TP2 with break-even SL (Dynamic Momentum mode)")
+        bt_tp1_r = st.number_input("TP1 (R)", 0.5, 5.0, float(cfg.get("tp1_r", 1.0)), 0.25,
+                                    format="%.2f", key="bt_tp1",
+                                    help="First exit target — 50% of position")
+        bt_tp2_r = st.number_input("TP2 (R)", 1.0, 10.0, float(cfg.get("tp2_r", 3.0)), 0.25,
+                                    format="%.2f", key="bt_tp2",
+                                    help="Second exit target — remaining 50%")
+        if not bt_scale_out:
+            bt_rr = st.slider("Risk:Reward (single-leg)", 1.0, 5.0, risk_ratio, 0.5, key="bt_rr")
+        else:
+            bt_rr = risk_ratio  # unused in scale-out mode
+    with bc4:
+        bt_risk_mode = st.radio("Sizing Mode", ["% of Equity", "Fixed USD"],
+                                 index=0, horizontal=False, key="bt_risk_mode")
+        if bt_risk_mode == "% of Equity":
+            bt_risk_pct = st.number_input("Risk % per Trade", 0.1, 5.0,
+                                           float(cfg.get("risk_pct_equity", 1.0)), 0.1,
+                                           format="%.1f", key="bt_risk_pct")
+            bt_equity   = st.number_input("Starting Equity ($)", 10_000, 10_000_000,
+                                           100_000, 10_000, key="bt_equity")
+            bt_pos      = int(pos_size)  # not used in risk-pct mode
+        else:
+            bt_risk_pct = 0.0
+            bt_equity   = 100_000.0
+            bt_pos      = st.number_input("Position Size (USD)", 100, 100_000,
+                                           int(pos_size), 100, key="bt_pos")
 
     run_btn = st.button("▶  Run Backtest", type="primary", use_container_width=False)
 
@@ -868,16 +893,22 @@ with tab_bt:
             if not api_key:
                 st.error("ALPACA_API_KEY not set. Add it to .env or environment.")
             else:
-                with st.spinner(f"Fetching {bt_symbol} bars {bt_start} → {bt_end}…"):
+                mode_label = f"Two-Leg Scale-Out (TP1={bt_tp1_r}R / TP2={bt_tp2_r}R)" if bt_scale_out else f"Classic (RR={bt_rr})"
+                with st.spinner(f"Backtesting {bt_symbol}  {bt_start} → {bt_end}  [{mode_label}]…"):
                     engine = BacktestEngine(api_key, api_secret)
                     result = engine.run_backtest(
-                        symbol           = bt_symbol,
-                        start_date       = bt_start,
-                        end_date         = bt_end,
-                        orb_minutes      = bt_orb,
-                        risk_ratio       = bt_rr,
-                        stop_loss_type   = bt_sl_type,
-                        position_size_usd= float(bt_pos),
+                        symbol            = bt_symbol,
+                        start_date        = bt_start,
+                        end_date          = bt_end,
+                        orb_minutes       = bt_orb,
+                        risk_ratio        = bt_rr,
+                        stop_loss_type    = bt_sl_type,
+                        position_size_usd = float(bt_pos),
+                        slippage_bps      = bt_slippage,
+                        tp1_r             = bt_tp1_r if bt_scale_out else 0.0,
+                        tp2_r             = bt_tp2_r if bt_scale_out else 0.0,
+                        risk_pct_equity   = bt_risk_pct,
+                        starting_equity   = float(bt_equity),
                     )
 
                 if result.error:
@@ -902,20 +933,25 @@ with tab_bt:
             f"|  {result.start_date} → {result.end_date}"
         )
 
-        # Stats row
-        s1,s2,s3,s4,s5,s6 = st.columns(6)
-        s1.metric("Total Trades",  s.total_trades)
-        s2.metric("Win Rate",      f"{s.win_rate}%")
-        s3.metric("Total PnL",     f"${s.total_pnl:+.2f}")
-        s4.metric("Profit Factor", f"{s.profit_factor:.2f}" if s.profit_factor != float("inf") else "∞")
-        s5.metric("Max Drawdown",  f"-${s.max_drawdown:.2f}")
-        s6.metric("Avg R",         f"{s.avg_r_multiple:.2f}R")
+        # Stats rows
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        s1.metric("Total Trades",   s.total_trades)
+        s2.metric("Win Rate",       f"{s.win_rate}%")
+        s3.metric("Total PnL",      f"${s.total_pnl:+.2f}")
+        s4.metric("Profit Factor",  f"{s.profit_factor:.2f}" if s.profit_factor != float("inf") else "∞")
+        s5.metric("Max Drawdown",   f"-${s.max_drawdown:.2f}")
+        s6.metric("Avg R",          f"{s.avg_r_multiple:.2f}R")
 
-        sc1, sc2 = st.columns(2)
-        sc1.metric("Avg Win",    f"${s.avg_win:.2f}")
-        sc2.metric("Avg Loss",   f"${s.avg_loss:.2f}")
+        sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
+        sc1.metric("Avg Win",        f"${s.avg_win:.2f}")
+        sc2.metric("Avg Loss",       f"${s.avg_loss:.2f}")
+        sc3.metric("Expectancy",     f"${s.expectancy:.2f}")
+        sc4.metric("Sharpe",         f"{s.sharpe_ratio:.2f}")
+        sc5.metric("Recovery Factor",f"{s.recovery_factor:.2f}" if s.recovery_factor != float("inf") else "∞")
+        sc6.metric("Total Fees",     f"${s.total_fees:.2f}")
 
         # Charts
+        _is_scale_out = result.tp1_r > 0 and result.tp2_r > result.tp1_r
         trades_df_bt = pd.DataFrame([
             dict(date=t.date, symbol=t.symbol, side=t.side,
                  entry_price=t.entry_price, take_profit=t.take_profit,
@@ -923,7 +959,10 @@ with tab_bt:
                  range_low=t.range_low, exit_price=t.exit_price,
                  exit_reason=t.exit_reason, qty=t.qty,
                  pnl=t.pnl, r_multiple=t.r_multiple,
-                 entry_time=t.entry_time, exit_time=t.exit_time)
+                 entry_time=t.entry_time, exit_time=t.exit_time,
+                 tp1_price=t.tp1_price, tp2_price=t.tp2_price,
+                 leg1_exit=t.leg1_exit_reason, leg1_pnl=t.leg1_pnl,
+                 fees=t.fees)
             for t in trades_list
         ])
 
@@ -938,42 +977,72 @@ with tab_bt:
         # Trade log
         st.subheader("Trade Log")
 
-        display = trades_df_bt[[
-            "date","side","entry_price","take_profit","stop_loss",
-            "exit_price","exit_reason","qty","pnl","r_multiple"
-        ]].copy()
+        _exit_icons = {
+            "TP":  "✅ TP",  "TP2": "✅ TP2", "TP1": "✅ TP1",
+            "SL":  "❌ SL",  "BE":  "↩️ BE",
+            "EOD": "🕐 EOD",
+        }
+        _l1_icons = {
+            "TP1": "✅ TP1", "SL": "❌ SL", "EOD": "🕐 EOD", "": "",
+        }
 
-        # Human-readable columns
-        display["#"]       = range(1, len(display) + 1)
-        display["Result"]  = display["exit_reason"].map({"TP": "✅ TP", "SL": "❌ SL", "EOD": "🕐 3:55 EOD"})
-        display["Side"]    = display["side"].map({"LONG": "▲ LONG", "SHORT": "▼ SHORT"})
-        display["PnL"]     = display["pnl"].map(lambda x: f"+${x:.2f}" if x >= 0 else f"-${abs(x):.2f}")
-        display["R"]       = display["r_multiple"].map(lambda x: f"+{x:.2f}R" if x >= 0 else f"{x:.2f}R")
+        display = trades_df_bt.copy()
+        display["#"]      = range(1, len(display) + 1)
+        display["Side"]   = display["side"].map({"LONG": "▲ LONG", "SHORT": "▼ SHORT"})
+        display["Final"]  = display["exit_reason"].map(lambda x: _exit_icons.get(x, x))
+        display["PnL"]    = display["pnl"].map(lambda x: f"+${x:.2f}" if x >= 0 else f"-${abs(x):.2f}")
+        display["R"]      = display["r_multiple"].map(lambda x: f"+{x:.2f}R" if x >= 0 else f"{x:.2f}R")
+        display["Fees"]   = display["fees"].map(lambda x: f"${x:.3f}")
+
+        if _is_scale_out:
+            display["Leg1"]     = display["leg1_exit"].map(lambda x: _l1_icons.get(x, x))
+            display["Leg1 PnL"] = display["leg1_pnl"].map(lambda x: f"+${x:.2f}" if x >= 0 else f"-${abs(x):.2f}")
+            show_cols = [
+                "#", "date", "Side", "entry_price", "tp1_price", "tp2_price", "stop_loss",
+                "exit_price", "Leg1", "Leg1 PnL", "Final", "qty", "PnL", "R", "Fees",
+            ]
+            col_cfg = {
+                "#":           st.column_config.NumberColumn(width="small"),
+                "date":        st.column_config.TextColumn("Date", width="small"),
+                "Side":        st.column_config.TextColumn(width="small"),
+                "entry_price": st.column_config.NumberColumn("Entry", format="$%.2f", width="small"),
+                "tp1_price":   st.column_config.NumberColumn("TP1", format="$%.2f", width="small"),
+                "tp2_price":   st.column_config.NumberColumn("TP2", format="$%.2f", width="small"),
+                "stop_loss":   st.column_config.NumberColumn("SL", format="$%.2f", width="small"),
+                "exit_price":  st.column_config.NumberColumn("Avg Exit", format="$%.2f", width="small"),
+                "Leg1":        st.column_config.TextColumn(width="small"),
+                "Leg1 PnL":    st.column_config.TextColumn(width="small"),
+                "Final":       st.column_config.TextColumn(width="small"),
+                "qty":         st.column_config.NumberColumn("Qty", width="small"),
+                "PnL":         st.column_config.TextColumn(width="small"),
+                "R":           st.column_config.TextColumn(width="small"),
+                "Fees":        st.column_config.TextColumn(width="small"),
+            }
+        else:
+            show_cols = [
+                "#", "date", "Side", "entry_price", "take_profit", "stop_loss",
+                "exit_price", "Final", "qty", "PnL", "R", "Fees",
+            ]
+            col_cfg = {
+                "#":           st.column_config.NumberColumn(width="small"),
+                "date":        st.column_config.TextColumn("Date", width="small"),
+                "Side":        st.column_config.TextColumn(width="small"),
+                "entry_price": st.column_config.NumberColumn("Entry", format="$%.2f", width="small"),
+                "take_profit": st.column_config.NumberColumn("TP", format="$%.2f", width="small"),
+                "stop_loss":   st.column_config.NumberColumn("SL", format="$%.2f", width="small"),
+                "exit_price":  st.column_config.NumberColumn("Exit", format="$%.2f", width="small"),
+                "Final":       st.column_config.TextColumn("Result", width="small"),
+                "qty":         st.column_config.NumberColumn("Qty", width="small"),
+                "PnL":         st.column_config.TextColumn(width="small"),
+                "R":           st.column_config.TextColumn(width="small"),
+                "Fees":        st.column_config.TextColumn(width="small"),
+            }
 
         st.dataframe(
-            display.rename(columns={
-                "date": "Date", "entry_price": "Entry",
-                "take_profit": "TP", "stop_loss": "SL",
-                "exit_price": "Exit", "qty": "Qty",
-            })[[
-                "#", "Date", "Side", "Entry", "TP", "SL",
-                "Exit", "Result", "Qty", "PnL", "R"
-            ]],
+            display[show_cols],
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "#":      st.column_config.NumberColumn(width="small"),
-                "Date":   st.column_config.TextColumn(width="small"),
-                "Side":   st.column_config.TextColumn(width="small"),
-                "Entry":  st.column_config.NumberColumn(format="$%.2f", width="small"),
-                "TP":     st.column_config.NumberColumn(format="$%.2f", width="small"),
-                "SL":     st.column_config.NumberColumn(format="$%.2f", width="small"),
-                "Exit":   st.column_config.NumberColumn(format="$%.2f", width="small"),
-                "Result": st.column_config.TextColumn(width="small"),
-                "Qty":    st.column_config.NumberColumn(width="small"),
-                "PnL":    st.column_config.TextColumn(width="small"),
-                "R":      st.column_config.TextColumn(width="small"),
-            },
+            column_config=col_cfg,
         )
 
         # Skipped days breakdown

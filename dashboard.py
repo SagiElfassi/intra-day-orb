@@ -71,6 +71,18 @@ def load_config() -> dict:
         min_orb_volume=1_000_000,
         min_atr_pct=2.0,
         max_spread_pct=0.05,
+        # Dynamic Momentum scanner
+        gap_min_pct=1.5,
+        rvol_min=2.0,
+        scanner_top_n=5,
+        # Intraday filters
+        vwap_filter=True,
+        volume_surge_mult=1.5,
+        # Volatility-adjusted sizing
+        risk_pct_equity=1.0,
+        # Scale-out targets
+        tp1_r=1.0,
+        tp2_r=3.0,
     )
     if os.path.exists(CONFIG_PATH):
         try:
@@ -662,6 +674,46 @@ with st.sidebar:
         format="%.3f",
     )
 
+    st.subheader("Pre-Market Scanner")
+    gap_min_pct = st.number_input(
+        "Min Gap %", 0.0, 20.0, float(cfg.get("gap_min_pct", 1.5)), 0.1,
+        format="%.1f", help="Minimum overnight gap vs prior close",
+    )
+    rvol_min = st.number_input(
+        "Min RVOL", 0.5, 20.0, float(cfg.get("rvol_min", 2.0)), 0.1,
+        format="%.1f", help="Min relative volume vs 20-day average",
+    )
+    scanner_top_n = st.number_input(
+        "Top N symbols", 1, 20, int(cfg.get("scanner_top_n", 5)), 1,
+        help="How many top-scoring symbols to trade each day",
+    )
+
+    st.subheader("Momentum Filters")
+    vwap_filter = st.toggle(
+        "VWAP Filter", value=bool(cfg.get("vwap_filter", True)),
+        help="Long must break out above VWAP; short below",
+    )
+    volume_surge_mult = st.number_input(
+        "Volume Surge Multiplier", 1.0, 10.0,
+        float(cfg.get("volume_surge_mult", 1.5)), 0.1, format="%.1f",
+        help="Breakout bar volume ≥ N × avg ORB volume",
+    )
+
+    st.subheader("Scale-Out & Sizing")
+    risk_pct_equity = st.number_input(
+        "Risk % of Equity per Trade", 0.1, 5.0,
+        float(cfg.get("risk_pct_equity", 1.0)), 0.1, format="%.1f",
+        help="Max loss if SL is hit = equity × this %",
+    )
+    tp1_r = st.number_input(
+        "TP1 (R-multiple)", 0.5, 5.0, float(cfg.get("tp1_r", 1.0)), 0.25,
+        format="%.2f", help="First exit target — 50% of position",
+    )
+    tp2_r = st.number_input(
+        "TP2 (R-multiple)", 1.0, 10.0, float(cfg.get("tp2_r", 3.0)), 0.25,
+        format="%.2f", help="Second exit target — remaining 50%",
+    )
+
     if st.button("💾 Save Config", use_container_width=True):
         new_cfg = dict(
             symbols=symbols, orb_minutes=orb_minutes,
@@ -669,6 +721,12 @@ with st.sidebar:
             stop_loss_type=sl_type, alpaca_paper=alpaca_paper,
             min_orb_volume=min_orb_volume, min_atr_pct=min_atr_pct,
             max_spread_pct=max_spread_pct,
+            gap_min_pct=gap_min_pct, rvol_min=rvol_min,
+            scanner_top_n=int(scanner_top_n),
+            vwap_filter=vwap_filter,
+            volume_surge_mult=volume_surge_mult,
+            risk_pct_equity=risk_pct_equity,
+            tp1_r=tp1_r, tp2_r=tp2_r,
         )
         save_config(new_cfg)
         cfg = new_cfg
@@ -1176,62 +1234,91 @@ with tab_scanner:
 
 with tab_rules:
 
-    # Use current sidebar values so the formulas are live
-    rng_example   = 2.50   # illustrative ORB range for the diagram
-    entry_long    = 100.00
-    entry_short   = 97.50
-    tp_long       = round(entry_long  + rng_example * risk_ratio, 2)
-    sl_long_mid   = round(entry_long  - rng_example / 2, 2)
-    sl_long_hard  = round(entry_long  - rng_example, 2)
-    tp_short      = round(entry_short - rng_example * risk_ratio, 2)
-    sl_short_mid  = round(entry_short + rng_example / 2, 2)
-    sl_short_hard = round(entry_short + rng_example, 2)
+    # Pull live sidebar values so all formulas update in real time
+    _gap_min     = cfg.get("gap_min_pct", 1.5)
+    _rvol_min    = cfg.get("rvol_min", 2.0)
+    _top_n       = int(cfg.get("scanner_top_n", 5))
+    _vwap_on     = cfg.get("vwap_filter", True)
+    _surge_mult  = cfg.get("volume_surge_mult", 1.5)
+    _risk_pct    = cfg.get("risk_pct_equity", 1.0)
+    _tp1_r       = cfg.get("tp1_r", 1.0)
+    _tp2_r       = cfg.get("tp2_r", 3.0)
 
-    st.subheader("Opening Range Breakout — Entry Conditions")
+    rng_example  = 2.50
+    entry_long   = 100.00
+    entry_short  = 97.50
+    orb_risk     = rng_example / 2  # midpoint SL distance
+
+    tp1_l  = round(entry_long  + orb_risk * _tp1_r, 2)
+    tp2_l  = round(entry_long  + orb_risk * _tp2_r, 2)
+    sl_l   = round(entry_long  - orb_risk, 2)
+    tp1_s  = round(entry_short - orb_risk * _tp1_r, 2)
+    tp2_s  = round(entry_short - orb_risk * _tp2_r, 2)
+    sl_s   = round(entry_short + orb_risk, 2)
+
+    st.subheader("Dynamic Momentum ORB — Entry Conditions")
     st.caption(f"All formulas reflect your current sidebar settings: "
-               f"**{orb_minutes}-min ORB · {risk_ratio}R · {sl_type} stop · ${pos_size} per trade**")
+               f"**{orb_minutes}-min ORB · Gap ≥{_gap_min:.1f}% · RVOL ≥{_rvol_min:.1f}× · "
+               f"Risk {_risk_pct:.1f}% equity · TP1={_tp1_r:.1f}R / TP2={_tp2_r:.1f}R**")
 
-    # ── Analyst Filters ───────────────────────────────────────────────────────
+    # ── Strategy Overview ─────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### 🔍 Analyst Filters")
-    st.caption("Applied before a trade is taken. Configured in the sidebar.")
+    st.markdown("### Strategy Overview")
 
-    af1, af2, af3 = st.columns(3)
-    with af1:
-        st.markdown(f"""
-**📊 Volume Filter**
+    st.info("""
+**Dynamic Momentum ORB** combines a pre-market scanning pass with intraday momentum confirmation to produce a high-quality trade list every morning.
 
-ORB window must accumulate
-≥ **{min_orb_volume:,} shares**
-in the first **{orb_minutes} minutes**.
+- **Pre-market scanner** runs at 4:00 AM–9:25 AM, ranking stocks by overnight gap and relative volume. Only the top symbols trade that day.
+- **Intraday momentum filters** (VWAP alignment + volume surge) confirm genuine breakout momentum before a position is opened.
+- **Volatility-adjusted sizing** risking a fixed % of account equity, so position size automatically scales with the stock's move potential.
+- **Two-leg scale-out** locks in profits at TP1 (1R) and moves the stop to break-even, letting the second leg ride to TP2 (3R) risk-free.
+- **Bracket orders** sent to Alpaca ensure the broker manages exits even if the bot crashes.
+- **Auto-flatten at 3:55 PM** eliminates overnight exposure.
+    """)
 
-*Ensures you can exit a ${pos_size:,}
-position without moving the market.*
-        """)
-    with af2:
-        st.markdown(f"""
-**📈 ATR Filter**
+    ov1, ov2, ov3, ov4 = st.columns(4)
+    with ov1:
+        st.metric("TP1 Target", f"{_tp1_r:.1f}R", "50% position")
+    with ov2:
+        st.metric("TP2 Target", f"{_tp2_r:.1f}R", "50% position")
+    with ov3:
+        st.metric("Risk per trade", f"{_risk_pct:.1f}% equity", "volatility-adjusted")
+    with ov4:
+        st.metric("Top N symbols", str(_top_n), "from scanner")
 
-14-day Average True Range
-must be ≥ **{min_atr_pct:.1f}%** of price.
-
-*Filters out "sleepy" stocks
-that can't reach the {risk_ratio}:1 TP target.*
-        """)
-    with af3:
-        st.markdown(f"""
-**⚖️ Spread Filter**
-
-Bid-ask spread must be
-≤ **{max_spread_pct:.3f}%** of ask price.
-
-*Eliminates the hidden entry/exit
-cost that kills small accounts.*
-        """)
-
-    # ── Phase 1 ───────────────────────────────────────────────────────────────
+    # ── Phase 0 : Pre-Market Scanner ──────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### Phase 1 · Build the Opening Range")
+    st.markdown("### Phase 0 · Pre-Market Scanner  *(4:00 AM → 9:25 AM)*")
+
+    sc1, sc2 = st.columns([1, 1])
+    with sc1:
+        st.markdown(f"""
+| Metric | Formula | Threshold |
+|--------|---------|-----------|
+| **Gap %** | `(first_pm_open − prev_close) / prev_close × 100` | ≥ **{_gap_min:.1f}%** |
+| **RVOL** | `(pm_vol / 325 min) ÷ (avg_daily_vol / 390 min)` | ≥ **{_rvol_min:.1f}×** |
+| **ATR %** | 14-day average true range as % of price | ≥ **{min_atr_pct:.1f}%** |
+| **Top N** | Symbols ranked by Gap% × RVOL score | Keep **{_top_n}** |
+
+Scanner fires at **9:25 AM EST**. The resulting symbol list becomes `active_symbols`
+— only these tickers receive intraday signals for the rest of the day.
+        """)
+    with sc2:
+        st.info(f"""
+**Why scan pre-market?**
+
+Most ORB breakouts with follow-through come from stocks that *already have momentum* before the bell:
+- A large gap (≥ {_gap_min:.1f}%) signals a catalyst (earnings, news, upgrade).
+- High RVOL (≥ {_rvol_min:.1f}×) shows institutional participation, not just retail noise.
+
+Scanning the entire universe and picking the top **{_top_n}** avoids the "boiling the ocean" problem and keeps the bot focused on the strongest setups of the day.
+
+*RVOL is calculated as a rate comparison — premarket volume per minute vs. the 20-day average volume per minute — so it fairly compares tickers with different intraday rhythms.*
+        """)
+
+    # ── Phase 1 : Build the Opening Range ─────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Phase 1 · Build the Opening Range  *(9:30 AM)*")
 
     p1c1, p1c2 = st.columns([1, 1])
     with p1c1:
@@ -1240,149 +1327,172 @@ cost that kills small accounts.*
 |-----------|-------|
 | Market opens | **9:30 AM EST** |
 | ORB window | **9:30 → 9:{30 + orb_minutes:02d} AM EST** ({orb_minutes} bars) |
-| Range High | `max(high)` of all {orb_minutes} bars |
-| Range Low | `min(low)` of all {orb_minutes} bars |
+| Range High | `max(high)` over ORB window |
+| Range Low | `min(low)` over ORB window |
 | Range Mid | `(High + Low) / 2` |
-| Minimum bars required | **{min(orb_minutes, 13)} of {orb_minutes}** (skipped if data gap) |
+| Min bars required | **{min(orb_minutes, 13)} of {orb_minutes}** (skipped on data gap) |
+| VWAP | Running `Σ(typical_price × vol) / Σ(vol)` from 9:30 AM |
         """)
     with p1c2:
         st.info(f"""
-**Why validate bar count?**
+**VWAP accumulation**
 
-The first minutes of trading are chaotic — your broker may deliver bars late or skip them entirely during high-volatility opens (earnings, macro events).
+VWAP (Volume Weighted Average Price) is computed live from the first bar of the session.
+It acts as the market's "fair value" reference — breakouts *above* VWAP are statistically stronger for longs, and breakouts *below* are stronger for shorts.
 
-If fewer than **{min(orb_minutes, 13)} bars** arrive in the {orb_minutes}-minute window, the range is marked **INVALID** and no trade is taken that day. This protects against setting a false range from incomplete data.
+The bot resets VWAP every morning and accumulates it bar-by-bar, so it reflects intraday price discovery correctly.
         """)
 
-    # ── Phase 2 ───────────────────────────────────────────────────────────────
+    # ── Phase 2 : Breakout Signal ─────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### Phase 2 · Detect the Breakout Signal")
+    st.markdown("### Phase 2 · Detect the Breakout + Momentum Confirmation")
 
     st.markdown(f"""
 The bot watches every 1-minute bar **after 9:{30 + orb_minutes:02d} AM EST**.
-A signal fires on the **close** of the bar — not the high/low — to avoid wicks.
+A signal requires **all three conditions** to be true simultaneously:
 
-| Signal | Condition | Direction |
-|--------|-----------|-----------|
-| 🟢 **LONG** | Bar close `>` ORB High | Buy |
-| 🔴 **SHORT** | Bar close `<` ORB Low | Sell short |
-| ⬜ No trade | Close inside range | Wait for next bar |
+| Gate | Long | Short |
+|------|------|-------|
+| **Price breakout** | Bar close `>` ORB High | Bar close `<` ORB Low |
+| **VWAP filter** {"✅ enabled" if _vwap_on else "⚠️ disabled"} | Close `>` VWAP | Close `<` VWAP |
+| **Volume surge** | Bar volume `≥` {_surge_mult:.1f}× avg ORB volume | Bar volume `≥` {_surge_mult:.1f}× avg ORB volume |
+| **Spread filter** | Bid-ask spread `≤` {max_spread_pct:.3f}% of ask | Bid-ask spread `≤` {max_spread_pct:.3f}% of ask |
 
-> **One trade per symbol per day.** Once a signal fires, the symbol is marked `IN_TRADE` and no further signals are checked.
+> **One trade per symbol per day.** Once a signal fires, the symbol transitions `SCANNING → SUBMITTING → IN_TRADE`.
     """)
 
-    # ── Phase 3 ───────────────────────────────────────────────────────────────
+    fil1, fil2 = st.columns(2)
+    with fil1:
+        st.markdown(f"""
+**📐 VWAP Filter** {"(ON)" if _vwap_on else "(OFF)"}
+
+Ensures the stock's intraday momentum is aligned with the breakout direction.
+A close above ORB High but *below* VWAP is a weak breakout — the "average" buyer is still underwater and will sell into any rally.
+
+`Long signal requires:  close > VWAP`
+`Short signal requires: close < VWAP`
+        """)
+    with fil2:
+        st.markdown(f"""
+**📊 Volume Surge Filter**
+
+Genuine breakouts expand volume.
+A close above the range on low volume is likely a false breakout that will snap back.
+
+`Bar volume ≥ {_surge_mult:.1f} × avg_orb_volume`
+
+`avg_orb_volume` = average per-bar volume across the {orb_minutes}-minute ORB window.
+        """)
+
+    # ── Phase 3 : Scale-Out Execution ────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### Phase 3 · Bracket Order Calculation")
+    st.markdown("### Phase 3 · Two-Leg Scale-Out Execution")
 
-    bc1, bc2 = st.columns(2)
-
-    with bc1:
-        st.markdown("#### 🟢 Long Entry")
-        sl_val_long = sl_long_mid if sl_type == "midpoint" else sl_long_hard
+    ex1, ex2 = st.columns(2)
+    with ex1:
+        st.markdown("#### 🟢 Long — Scale-Out Levels")
         st.markdown(f"""
 ```
-ORB Range   = High − Low
-            = {entry_long:.2f} − {entry_long - rng_example:.2f} = {rng_example:.2f}
+Entry      ≈ {entry_long:.2f}  (close above ORB High)
+Risk       = Entry − SL = {entry_long - sl_l:.2f}  (midpoint stop)
+SL         = {sl_l:.2f}
 
-Entry       = close price at breakout bar
-            ≈ {entry_long:.2f}  (above ORB High)
+Leg 1 (50% qty)
+  TP1      = Entry + {_tp1_r:.1f}R = {tp1_l:.2f}
+  After TP1 fills → SL moves to break-even ({entry_long:.2f})
 
-Take Profit = Entry + (Range × Ratio)
-            = {entry_long:.2f} + ({rng_example:.2f} × {risk_ratio})
-            = {tp_long:.2f}
+Leg 2 (50% qty)
+  TP2      = Entry + {_tp2_r:.1f}R = {tp2_l:.2f}
+  SL       = break-even after Leg 1 fills
 
-Stop Loss   = {"Range Midpoint" if sl_type == "midpoint" else "ORB Low (hard)"}
-            = {sl_val_long:.2f}
+Worst case  → both legs stopped out at SL {sl_l:.2f}
+After TP1   → Leg 2 rides risk-free to {tp2_l:.2f}
+```
+        """)
+    with ex2:
+        st.markdown("#### 🔴 Short — Scale-Out Levels")
+        st.markdown(f"""
+```
+Entry      ≈ {entry_short:.2f}  (close below ORB Low)
+Risk       = SL − Entry = {sl_s - entry_short:.2f}  (midpoint stop)
+SL         = {sl_s:.2f}
 
-Risk        = Entry − SL = {entry_long - sl_val_long:.2f}
-Reward      = TP − Entry = {tp_long - entry_long:.2f}
-R:R         = 1 : {(tp_long - entry_long) / (entry_long - sl_val_long):.1f}
+Leg 1 (50% qty)
+  TP1      = Entry − {_tp1_r:.1f}R = {tp1_s:.2f}
+  After TP1 fills → SL moves to break-even ({entry_short:.2f})
+
+Leg 2 (50% qty)
+  TP2      = Entry − {_tp2_r:.1f}R = {tp2_s:.2f}
+  SL       = break-even after Leg 1 fills
+
+Worst case  → both legs stopped out at SL {sl_s:.2f}
+After TP1   → Leg 2 rides risk-free to {tp2_s:.2f}
 ```
         """)
 
-    with bc2:
-        st.markdown("#### 🔴 Short Entry")
-        sl_val_short = sl_short_mid if sl_type == "midpoint" else sl_short_hard
-        st.markdown(f"""
-```
-ORB Range   = High − Low
-            = {entry_short + rng_example:.2f} − {entry_short:.2f} = {rng_example:.2f}
-
-Entry       = close price at breakout bar
-            ≈ {entry_short:.2f}  (below ORB Low)
-
-Take Profit = Entry − (Range × Ratio)
-            = {entry_short:.2f} − ({rng_example:.2f} × {risk_ratio})
-            = {tp_short:.2f}
-
-Stop Loss   = {"Range Midpoint" if sl_type == "midpoint" else "ORB High (hard)"}
-            = {sl_val_short:.2f}
-
-Risk        = SL − Entry = {sl_val_short - entry_short:.2f}
-Reward      = Entry − TP = {entry_short - tp_short:.2f}
-R:R         = 1 : {(entry_short - tp_short) / (sl_val_short - entry_short):.1f}
-```
-        """)
+    st.info("""
+**Implementation detail:** Two separate bracket orders are submitted simultaneously — one for each leg with its own TP and the same initial SL.
+After Leg 1's TP fills, the bot cancels Leg 2's original SL and replaces it with a stop at the entry price (break-even).
+Alpaca's OCO mechanism auto-cancels the paired SL when TP fills, so no orphan orders are left.
+    """)
 
     # ── Visual diagram ────────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### Visual Setup Diagram")
+    st.markdown("### Visual Setup Diagram — Long Entry")
 
     fig_diag = go.Figure()
 
-    orb_high  = 100.00
-    orb_low   = 97.50
-    orb_mid   = (orb_high + orb_low) / 2
-    orb_span  = orb_high - orb_low
-    e_long    = orb_high + 0.20
-    e_short   = orb_low  - 0.20
-    tp_l      = round(e_long  + orb_span * risk_ratio, 2)
-    sl_l      = round(orb_mid if sl_type == "midpoint" else orb_low,  2)
-    tp_s      = round(e_short - orb_span * risk_ratio, 2)
-    sl_s      = round(orb_mid if sl_type == "midpoint" else orb_high, 2)
+    orb_high_d = 100.00
+    orb_low_d  = 97.50
+    orb_mid_d  = (orb_high_d + orb_low_d) / 2
+    orb_span_d = orb_high_d - orb_low_d
+    e_l        = orb_high_d + 0.20
+    _risk      = e_l - orb_mid_d
+    _tp1_px    = round(e_l + _risk * _tp1_r, 2)
+    _tp2_px    = round(e_l + _risk * _tp2_r, 2)
+    _sl_px     = round(orb_mid_d, 2)
 
-    x = [0, 1]
-
-    # ORB range box
-    fig_diag.add_shape(type="rect", x0=0, x1=1, y0=orb_low, y1=orb_high,
+    # ORB box
+    fig_diag.add_shape(type="rect", x0=0, x1=1, y0=orb_low_d, y1=orb_high_d,
                        fillcolor="rgba(255,214,0,0.08)",
                        line=dict(color="rgba(255,214,0,0.5)", width=1))
+    # Profit zone (entry → TP2)
+    fig_diag.add_shape(type="rect", x0=0, x1=1, y0=e_l, y1=_tp2_px,
+                       fillcolor="rgba(0,230,118,0.05)", line=dict(width=0))
+    # Risk zone (SL → entry)
+    fig_diag.add_shape(type="rect", x0=0, x1=1, y0=_sl_px, y1=e_l,
+                       fillcolor="rgba(239,83,80,0.05)", line=dict(width=0))
 
     for y, label, color, dash in [
-        (orb_high, f"ORB High  {orb_high:.2f}",  "#FFD700", "dot"),
-        (orb_low,  f"ORB Low   {orb_low:.2f}",   "#FFA000", "dot"),
-        (orb_mid,  f"ORB Mid   {orb_mid:.2f}",   "#FFCC44", "dot"),
-        (tp_l,     f"TP (Long) {tp_l:.2f}",      "#00e676", "dash"),
-        (sl_l,     f"SL (Long) {sl_l:.2f}",      "#ef5350", "dash"),
-        (tp_s,     f"TP (Short) {tp_s:.2f}",     "#69f0ae", "dashdot"),
-        (sl_s,     f"SL (Short) {sl_s:.2f}",     "#ff5252", "dashdot"),
+        (orb_high_d, f"ORB High  {orb_high_d:.2f}",    "#FFD700", "dot"),
+        (orb_low_d,  f"ORB Low   {orb_low_d:.2f}",     "#FFA000", "dot"),
+        (orb_mid_d,  f"ORB Mid   {orb_mid_d:.2f}",     "#FFCC44", "dot"),
+        (_tp2_px,    f"TP2 ({_tp2_r:.1f}R)  {_tp2_px:.2f}",   "#00e676", "dash"),
+        (_tp1_px,    f"TP1 ({_tp1_r:.1f}R)  {_tp1_px:.2f}",   "#69f0ae", "dash"),
+        (e_l,        f"Entry / Break-even  {e_l:.2f}", "#82b1ff", "solid"),
+        (_sl_px,     f"Initial SL  {_sl_px:.2f}",      "#ef5350", "dash"),
     ]:
         fig_diag.add_shape(type="line", x0=0, x1=1, y0=y, y1=y,
                            line=dict(color=color, dash=dash, width=1.5))
         fig_diag.add_annotation(x=1.01, y=y, text=label, showarrow=False,
                                 xanchor="left", font=dict(size=11, color=color))
 
-    # Long entry arrow
-    fig_diag.add_annotation(x=0.5, y=e_long, ax=0.5, ay=orb_high + 0.05,
-                             text=f"▲ LONG entry ~{e_long:.2f}", showarrow=True,
-                             arrowhead=2, arrowcolor="#00e676",
-                             font=dict(color="#00e676", size=12))
-
-    # Short entry arrow
-    fig_diag.add_annotation(x=0.5, y=e_short, ax=0.5, ay=orb_low - 0.05,
-                             text=f"▼ SHORT entry ~{e_short:.2f}", showarrow=True,
-                             arrowhead=2, arrowcolor="#ef5350",
-                             font=dict(color="#ef5350", size=12))
-
-    # TP fill zones
-    fig_diag.add_shape(type="rect", x0=0, x1=1, y0=e_long, y1=tp_l,
-                       fillcolor="rgba(0,230,118,0.06)", line=dict(width=0))
-    fig_diag.add_shape(type="rect", x0=0, x1=1, y0=sl_l, y1=e_long,
-                       fillcolor="rgba(239,83,80,0.06)", line=dict(width=0))
+    # Entry arrow
+    fig_diag.add_annotation(x=0.5, y=e_l, ax=0.5, ay=orb_high_d + 0.05,
+                             text=f"▲ LONG entry ~{e_l:.2f}", showarrow=True,
+                             arrowhead=2, arrowcolor="#82b1ff",
+                             font=dict(color="#82b1ff", size=12))
+    # TP1 label
+    fig_diag.add_annotation(x=0.25, y=_tp1_px,
+                             text=f"← 50% exits here ({_tp1_r:.1f}R) → SL moves to B/E",
+                             showarrow=False, font=dict(color="#69f0ae", size=10))
+    # TP2 label
+    fig_diag.add_annotation(x=0.25, y=_tp2_px,
+                             text=f"← remaining 50% exits here ({_tp2_r:.1f}R) risk-free",
+                             showarrow=False, font=dict(color="#00e676", size=10))
 
     fig_diag.update_layout(
-        height=480, margin=dict(l=10, r=160, t=20, b=20),
+        height=500, margin=dict(l=10, r=200, t=20, b=20),
         xaxis=dict(visible=False, range=[0, 1]),
         yaxis=dict(gridcolor="#1e2130", tickformat="$.2f"),
         showlegend=False,
@@ -1390,9 +1500,53 @@ R:R         = 1 : {(entry_short - tp_short) / (sl_val_short - entry_short):.1f}
     _dark_layout(fig_diag)
     st.plotly_chart(fig_diag, use_container_width=True)
 
-    # ── Phase 4 : Risk Management ─────────────────────────────────────────────
+    # ── Phase 4 : Position Sizing ─────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### Phase 4 · Risk Management & Safety")
+    st.markdown("### Phase 4 · Volatility-Adjusted Position Sizing")
+
+    sz1, sz2 = st.columns([1, 1])
+    with sz1:
+        st.markdown(f"""
+```
+risk_dollar   = account_equity × {_risk_pct:.1f}%
+risk_per_share = entry_price − sl_price
+total_qty      = floor(risk_dollar ÷ risk_per_share)
+                 (minimum 2 shares)
+half_qty       = total_qty ÷ 2          → Leg 1
+remaining_qty  = total_qty − half_qty   → Leg 2
+```
+
+This means **every trade risks the same dollar amount** regardless of entry price.
+A high-volatility stock with a wide SL gets fewer shares.
+A tight-range stock gets more shares.
+        """)
+    with sz2:
+        st.markdown(f"#### Sizing examples at {_risk_pct:.1f}% risk, $100,000 equity")
+        _eq = 100_000
+        _rd = _eq * _risk_pct / 100
+        ex_rows = []
+        for entry_px, sl_distance in [(50, 1.0), (100, 1.5), (200, 2.5), (500, 5.0)]:
+            rps = sl_distance
+            qty = max(2, int(_rd / rps))
+            ex_rows.append({
+                "Entry ($)": entry_px,
+                "Risk/share ($)": round(rps, 2),
+                "Total Qty": qty,
+                "Max Loss ($)": round(qty * rps, 2),
+            })
+        st.dataframe(
+            pd.DataFrame(ex_rows), use_container_width=True, hide_index=True,
+            column_config={
+                "Entry ($)":       st.column_config.NumberColumn(format="$%.0f"),
+                "Risk/share ($)":  st.column_config.NumberColumn(format="$%.2f"),
+                "Total Qty":       st.column_config.NumberColumn(),
+                "Max Loss ($)":    st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
+
+    # ── Phase 5 : Risk Management ─────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Phase 5 · Risk Management & Safety")
 
     rm1, rm2, rm3 = st.columns(3)
     with rm1:
@@ -1417,34 +1571,50 @@ Every day at **3:55 PM EST** (5 min before close):
 Prevents overnight exposure regardless of whether TP/SL was hit.
         """)
     with rm3:
-        st.markdown(f"""
-**📦 Bracket Orders**
+        st.markdown("""
+**📦 Broker-Managed Exits**
 
-Entry + TP + SL are sent as a **single atomic instruction** to Alpaca.
+Two bracket orders (one per leg) are submitted atomically to Alpaca.
+Each has its own TP and the shared initial SL.
 
-If your bot crashes after submission, the broker still manages the exits. You are never left with a naked position.
-
-Position size: **${pos_size:,}** per trade
-Qty = `floor({pos_size} ÷ entry_price)`
+If the bot crashes after submission, Alpaca's OCO mechanism still manages all exits.
+**You are never left with a naked position.**
         """)
 
-    # ── Position Sizing ───────────────────────────────────────────────────────
+    # ── Analyst Filters ───────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### Position Sizing Examples")
+    st.markdown("### Analyst Filters")
+    st.caption("Applied in addition to the momentum confirmation before any order is sent.")
 
-    examples = [50, 100, 200, 500]
-    sizing_data = {
-        "Entry Price ($)": examples,
-        "Qty (shares)": [max(1, int(pos_size // p)) for p in examples],
-        "Actual Exposure ($)": [max(1, int(pos_size // p)) * p for p in examples],
-    }
-    st.dataframe(
-        pd.DataFrame(sizing_data),
-        use_container_width=False,
-        hide_index=True,
-        column_config={
-            "Entry Price ($)":    st.column_config.NumberColumn(format="$%.0f"),
-            "Qty (shares)":       st.column_config.NumberColumn(),
-            "Actual Exposure ($)":st.column_config.NumberColumn(format="$%.0f"),
-        },
-    )
+    af1, af2, af3 = st.columns(3)
+    with af1:
+        st.markdown(f"""
+**📊 Volume Filter**
+
+ORB window must accumulate
+≥ **{min_orb_volume:,} shares**
+in the first **{orb_minutes} minutes**.
+
+*Ensures you can exit without
+moving the market.*
+        """)
+    with af2:
+        st.markdown(f"""
+**📈 ATR Filter**
+
+14-day Average True Range
+must be ≥ **{min_atr_pct:.1f}%** of price.
+
+*Filters out low-volatility stocks
+that can't reach even TP1.*
+        """)
+    with af3:
+        st.markdown(f"""
+**⚖️ Spread Filter**
+
+Bid-ask spread must be
+≤ **{max_spread_pct:.3f}%** of ask price.
+
+*Eliminates hidden entry/exit
+cost on thinly-traded names.*
+        """)

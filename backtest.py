@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
@@ -179,6 +180,9 @@ class BacktestEngine:
         tp2_r: float = 0.0,
         risk_pct_equity: float = 0.0,
         starting_equity: float = 100_000.0,
+        # Momentum filters (match bot.py on_bar / _check_breakout logic)
+        vwap_filter: bool = False,
+        volume_surge_mult: float = 0.0,
     ) -> BacktestResult:
 
         result = BacktestResult(
@@ -225,6 +229,15 @@ class BacktestEngine:
             inferred_flatten = last_bar_ts - timedelta(minutes=4)
             flatten_at = min(inferred_flatten, default_flatten)
 
+            # ── Running VWAP from 9:30 AM (matches bot.py on_bar accumulation) ─
+            # Computed on day_df before slicing so scan_bars inherits the column.
+            _mkt_mask = day_df["timestamp"] >= mkt_open
+            _typ_px   = (day_df["high"] + day_df["low"] + day_df["close"]) / 3
+            _cum_tpv  = (_typ_px * day_df["volume"]).where(_mkt_mask, 0.0).cumsum()
+            _cum_vol  = day_df["volume"].where(_mkt_mask, 0.0).cumsum()
+            day_df    = day_df.copy()
+            day_df["_vwap"] = (_cum_tpv / _cum_vol.replace(0, np.nan)).ffill()
+
             orb_bars  = day_df[
                 (day_df["timestamp"] >= mkt_open) & (day_df["timestamp"] < orb_end)
             ]
@@ -267,11 +280,28 @@ class BacktestEngine:
                 continue
 
             # ── Entry: vectorized breakout detection ───────────────────────────
-            # Use numpy argmax on boolean arrays — O(n) with no Python loop overhead.
-            # argmax on a bool array returns the position of the first True value.
-            close_vals = scan_bars["close"].values
-            long_mask  = close_vals > rng_high
-            short_mask = close_vals < rng_low
+            # argmax on a bool array returns the index of the first True.
+            close_vals  = scan_bars["close"].values
+            vwap_vals   = scan_bars["_vwap"].values
+            volume_vals = scan_bars["volume"].values
+
+            # Average per-bar volume during the ORB window (for surge gate)
+            avg_orb_vol = orb_bars["volume"].mean() if not orb_bars.empty else 0.0
+
+            # Build filter masks — both default to all-True when the feature is off
+            if vwap_filter:
+                vwap_long_ok  = close_vals > vwap_vals
+                vwap_short_ok = close_vals < vwap_vals
+            else:
+                vwap_long_ok = vwap_short_ok = np.ones(len(scan_bars), dtype=bool)
+
+            if volume_surge_mult > 0 and avg_orb_vol > 0:
+                surge_ok = volume_vals >= avg_orb_vol * volume_surge_mult
+            else:
+                surge_ok = np.ones(len(scan_bars), dtype=bool)
+
+            long_mask  = (close_vals > rng_high) & vwap_long_ok  & surge_ok
+            short_mask = (close_vals < rng_low)  & vwap_short_ok & surge_ok
 
             has_long  = long_mask.any()
             has_short = short_mask.any()

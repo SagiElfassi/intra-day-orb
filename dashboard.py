@@ -909,6 +909,8 @@ with tab_bt:
                         tp2_r             = bt_tp2_r if bt_scale_out else 0.0,
                         risk_pct_equity   = bt_risk_pct,
                         starting_equity   = float(bt_equity),
+                        vwap_filter       = vwap_filter if bt_scale_out else False,
+                        volume_surge_mult = volume_surge_mult if bt_scale_out else 0.0,
                     )
 
                 if result.error:

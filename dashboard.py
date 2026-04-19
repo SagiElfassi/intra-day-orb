@@ -1174,10 +1174,11 @@ SCAN_UNIVERSE_DEFAULT = (
 )
 
 with tab_scanner:
-    st.subheader("ORB Stock Scanner")
-    st.caption("Ranks stocks by ORB performance over the selected lookback period using your current strategy settings.")
+    st.subheader("Dynamic Momentum Scanner")
+    st.caption("Ranks stocks by strategy performance over the lookback period. "
+               "Scale-Out mode applies all Dynamic Momentum filters (VWAP, volume surge, TP1/TP2).")
 
-    scn_col1, scn_col2 = st.columns([3, 1])
+    scn_col1, scn_col2, scn_col3 = st.columns([3, 1, 1])
     with scn_col1:
         universe_input = st.text_area(
             "Stock Universe (comma-separated)",
@@ -1193,17 +1194,40 @@ with tab_scanner:
             "Lookback Period", [7, 14, 30, 60, 90], index=1,
             format_func=lambda x: f"{x} days", key="scan_days",
         )
-        scan_orb  = st.radio(
+        scan_orb = st.radio(
             "ORB Timeframe", [5, 15, 30],
             index=[5, 15, 30].index(orb_minutes),
             format_func=lambda x: f"{x} min",
             horizontal=True, key="scan_orb_tf",
         )
+
+    with scn_col3:
+        scn_scale_out = st.toggle(
+            "Two-Leg Scale-Out", value=True, key="scn_scale_out",
+            help="Use TP1/TP2/VWAP/surge filters from sidebar config",
+        )
         rank_by = st.selectbox(
             "Rank By",
-            ["Total P&L", "Profit Factor", "Win Rate %", "Avg R", "# Trades"],
+            ["Total P&L", "Profit Factor", "Win Rate %", "Avg R", "Expectancy", "Sharpe", "# Trades"],
             key="scan_rank",
         )
+
+    # Derive scan params from sidebar config
+    scn_tp1_r    = float(cfg.get("tp1_r",             1.0)) if scn_scale_out else 0.0
+    scn_tp2_r    = float(cfg.get("tp2_r",             3.0)) if scn_scale_out else 0.0
+    scn_risk_pct = float(cfg.get("risk_pct_equity",   1.0)) if scn_scale_out else 0.0
+    scn_equity   = 100_000.0
+    scn_vwap     = bool(cfg.get("vwap_filter",        True)) if scn_scale_out else False
+    scn_surge    = float(cfg.get("volume_surge_mult", 1.5))  if scn_scale_out else 0.0
+
+    if scn_scale_out:
+        st.caption(
+            f"Mode: **Scale-Out** · TP1={scn_tp1_r:.1f}R / TP2={scn_tp2_r:.1f}R · "
+            f"Risk {scn_risk_pct:.1f}% · VWAP={'on' if scn_vwap else 'off'} · "
+            f"Surge={scn_surge:.1f}×"
+        )
+    else:
+        st.caption(f"Mode: **Classic** · RR={risk_ratio} · ${pos_size:,} fixed size")
 
     scan_btn = st.button("🔭  Run Scanner", type="primary", key="scan_run")
 
@@ -1220,19 +1244,27 @@ with tab_scanner:
             prog = st.progress(0, text="Starting scan…")
 
             for i, sym in enumerate(scan_symbols):
-                prog.progress((i + 1) / len(scan_symbols), text=f"Scanning {sym}  ({i+1}/{len(scan_symbols)})")
+                prog.progress((i + 1) / len(scan_symbols),
+                              text=f"Scanning {sym}  ({i+1}/{len(scan_symbols)})")
                 try:
                     result = BacktestEngine(api_key, api_secret).run_backtest(
-                        symbol=sym,
-                        start_date=scan_start,
-                        end_date=scan_end,
-                        orb_minutes=scan_orb,
-                        risk_ratio=risk_ratio,
-                        stop_loss_type=sl_type,
-                        position_size_usd=float(pos_size),
+                        symbol            = sym,
+                        start_date        = scan_start,
+                        end_date          = scan_end,
+                        orb_minutes       = scan_orb,
+                        risk_ratio        = risk_ratio,
+                        stop_loss_type    = sl_type,
+                        position_size_usd = float(pos_size),
+                        tp1_r             = scn_tp1_r,
+                        tp2_r             = scn_tp2_r,
+                        risk_pct_equity   = scn_risk_pct,
+                        starting_equity   = scn_equity,
+                        vwap_filter       = scn_vwap,
+                        volume_surge_mult = scn_surge,
                     )
                     if result.error or not result.trades:
-                        scan_rows.append({"Symbol": sym, "_no_trade": True, "_reason": result.error or "no signals"})
+                        scan_rows.append({"Symbol": sym, "_no_trade": True,
+                                          "_reason": result.error or "no signals"})
                         continue
                     s = result.stats
                     scan_rows.append({
@@ -1242,9 +1274,12 @@ with tab_scanner:
                         "Total P&L":     round(s.total_pnl, 2),
                         "Profit Factor": round(s.profit_factor, 2) if s.profit_factor != float("inf") else 999.0,
                         "Avg R":         round(s.avg_r_multiple, 2),
+                        "Expectancy":    round(s.expectancy, 2),
+                        "Sharpe":        round(s.sharpe_ratio, 2),
                         "Max DD ($)":    round(s.max_drawdown, 2),
                         "Avg Win":       round(s.avg_win, 2),
                         "Avg Loss":      round(s.avg_loss, 2),
+                        "Total Fees":    round(s.total_fees, 2),
                         "Skipped Days":  len(result.skipped_days),
                         "_no_trade":     False,
                         "_reason":       "",
@@ -1257,6 +1292,9 @@ with tab_scanner:
             st.session_state["scan_meta"] = {
                 "days": scan_days, "orb": scan_orb,
                 "start": str(scan_start), "end": str(scan_end),
+                "scale_out": scn_scale_out,
+                "tp1_r": scn_tp1_r, "tp2_r": scn_tp2_r,
+                "risk_pct": scn_risk_pct, "vwap": scn_vwap, "surge": scn_surge,
             }
 
     if "scan_results" in st.session_state:
@@ -1274,28 +1312,41 @@ with tab_scanner:
                 "Profit Factor":"Profit Factor",
                 "Win Rate %":   "Win Rate %",
                 "Avg R":        "Avg R",
+                "Expectancy":   "Expectancy",
+                "Sharpe":       "Sharpe",
                 "# Trades":     "Trades",
             }
             sort_col = rank_col_map.get(rank_by, "Total P&L")
             df_scan  = pd.DataFrame(traded).sort_values(sort_col, ascending=False).reset_index(drop=True)
             df_scan.index = range(1, len(df_scan) + 1)
 
-            period_label = f"{meta.get('start','?')} → {meta.get('end','?')}  ·  {meta.get('orb','?')}-min ORB"
+            _mode_lbl = (
+                f"Scale-Out TP1={meta.get('tp1_r',0):.1f}R / TP2={meta.get('tp2_r',0):.1f}R  ·  "
+                f"VWAP={'on' if meta.get('vwap') else 'off'}  ·  "
+                f"Surge={meta.get('surge',0):.1f}×"
+                if meta.get("scale_out") else "Classic single-leg"
+            )
+            period_label = (
+                f"{meta.get('start','?')} → {meta.get('end','?')}  ·  "
+                f"{meta.get('orb','?')}-min ORB  ·  {_mode_lbl}"
+            )
             st.markdown(f"**{len(df_scan)} symbols with trades** — {period_label}")
 
             # Summary metrics for top symbol
             top = df_scan.iloc[0]
-            m1, m2, m3, m4, m5 = st.columns(5)
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
             m1.metric("🏆 Top Symbol",  top["Symbol"])
             m2.metric("Total P&L",      f"${top['Total P&L']:+,.2f}")
             m3.metric("Win Rate",        f"{top['Win Rate %']:.0f}%")
             m4.metric("Profit Factor",   f"{top['Profit Factor']:.2f}")
-            m5.metric("Avg R",           f"{top['Avg R']:.2f}R")
+            m5.metric("Expectancy",      f"${top['Expectancy']:+.2f}")
+            m6.metric("Sharpe",          f"{top['Sharpe']:.2f}")
 
             st.divider()
 
             display_cols = ["Symbol", "Trades", "Win Rate %", "Total P&L",
-                            "Profit Factor", "Avg R", "Max DD ($)", "Skipped Days"]
+                            "Profit Factor", "Avg R", "Expectancy", "Sharpe",
+                            "Max DD ($)", "Total Fees", "Skipped Days"]
             st.dataframe(
                 df_scan[display_cols],
                 use_container_width=True,
@@ -1306,7 +1357,10 @@ with tab_scanner:
                     "Total P&L":     st.column_config.NumberColumn(format="$%+.2f"),
                     "Profit Factor": st.column_config.NumberColumn(format="%.2f", width="small"),
                     "Avg R":         st.column_config.NumberColumn(format="%.2f", width="small"),
+                    "Expectancy":    st.column_config.NumberColumn(format="$%+.2f"),
+                    "Sharpe":        st.column_config.NumberColumn(format="%.2f", width="small"),
                     "Max DD ($)":    st.column_config.NumberColumn(format="$%.2f"),
+                    "Total Fees":    st.column_config.NumberColumn(format="$%.2f"),
                     "Skipped Days":  st.column_config.NumberColumn(width="small"),
                 },
             )
@@ -1317,31 +1371,45 @@ with tab_scanner:
             top5 = df_scan.head(5)["Symbol"].tolist()
             api_key_scan, api_secret_scan = get_alpaca_credentials(alpaca_paper)
             scan_end_d   = date.today() - timedelta(days=1)
-            scan_start_d = scan_end_d - timedelta(days=scan_days)
+            scan_start_d = scan_end_d - timedelta(days=meta.get("days", scan_days))
+
+            @st.cache_data(ttl=3600)
+            def _scan_equity(s, sd, ed, orb, rr, slt, ps,
+                             key, sec, tp1, tp2, rpe, eq, vwap, surge):
+                from backtest import BacktestEngine as _BTE
+                r = _BTE(key, sec).run_backtest(
+                    symbol=s, start_date=sd, end_date=ed,
+                    orb_minutes=orb, risk_ratio=rr, stop_loss_type=slt,
+                    position_size_usd=float(ps),
+                    tp1_r=tp1, tp2_r=tp2, risk_pct_equity=rpe,
+                    starting_equity=eq, vwap_filter=vwap, volume_surge_mult=surge,
+                )
+                if r.trades:
+                    return pd.DataFrame({"pnl": [t.pnl for t in r.trades]})
+                return pd.DataFrame()
 
             eq_cols = st.columns(min(len(top5), 5))
             for col, sym in zip(eq_cols, top5):
                 with col:
-                    st.caption(sym)
+                    sym_row = df_scan[df_scan["Symbol"] == sym].iloc[0]
+                    pnl_color = "#00e676" if sym_row["Total P&L"] >= 0 else "#ef5350"
+                    st.caption(f"**{sym}** — ${sym_row['Total P&L']:+,.0f}")
                     try:
-                        from backtest import BacktestEngine as _BTE
-                        @st.cache_data(ttl=3600)
-                        def _scan_equity(s, sd, ed, orb, rr, sl, ps, key, sec):
-                            r = _BTE(key, sec).run_backtest(s, sd, ed, orb, rr, sl, ps)
-                            if r.trades:
-                                return pd.DataFrame({"pnl": [t.pnl for t in r.trades]})
-                            return pd.DataFrame()
-
                         eq_df = _scan_equity(
                             sym, scan_start_d, scan_end_d, scan_orb,
                             risk_ratio, sl_type, float(pos_size),
                             api_key_scan, api_secret_scan,
+                            meta.get("tp1_r", 0.0), meta.get("tp2_r", 0.0),
+                            meta.get("risk_pct", 0.0), scn_equity,
+                            meta.get("vwap", False), meta.get("surge", 0.0),
                         )
                         if not eq_df.empty:
                             fig_mini = go.Figure(go.Scatter(
                                 y=eq_df["pnl"].cumsum(),
-                                mode="lines", line=dict(color="#82b1ff", width=2),
-                                fill="tozeroy", fillcolor="rgba(130,177,255,0.1)",
+                                mode="lines",
+                                line=dict(color=pnl_color, width=2),
+                                fill="tozeroy",
+                                fillcolor=f"rgba({'0,230,118' if pnl_color == '#00e676' else '239,83,80'},0.08)",
                             ))
                             fig_mini.update_layout(
                                 height=140, margin=dict(l=0, r=0, t=0, b=0),
@@ -1357,7 +1425,8 @@ with tab_scanner:
         if no_signals:
             with st.expander(f"⚠️ No signals — {len(no_signals)} symbols", expanded=False):
                 st.dataframe(
-                    pd.DataFrame([{"Symbol": r["Symbol"], "Reason": r["_reason"]} for r in no_signals]),
+                    pd.DataFrame([{"Symbol": r["Symbol"], "Reason": r["_reason"]}
+                                  for r in no_signals]),
                     use_container_width=True, hide_index=True,
                 )
 

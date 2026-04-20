@@ -240,8 +240,11 @@ class BacktestEngine:
             ),
             axis=1,
         )
-        daily["atr14"] = daily["tr"].rolling(14, min_periods=1).mean()
-        daily["atr_pct"] = daily["atr14"] / daily["daily_close"] * 100
+        # shift(1): trade_date uses ATR from data UP TO YESTERDAY (matches bot.py _fetch_atr_pct
+        # which fetches end=now-1day). Without the shift, today's own wide range would inflate
+        # ATR and cause the LOW_ATR filter to pass on the most volatile (easiest-to-win) days.
+        daily["atr14"] = daily["tr"].rolling(14, min_periods=1).mean().shift(1).fillna(0.0)
+        daily["atr_pct"] = (daily["atr14"] / daily["daily_close"] * 100).fillna(0.0)
         _atr_by_date        = dict(zip(daily["_date"], daily["atr_pct"]))   # % (for filter)
         _atr_dollar_by_date = dict(zip(daily["_date"], daily["atr14"]))     # $ (for SL calc)
 
@@ -343,50 +346,70 @@ class BacktestEngine:
                 ))
                 continue
 
-            # ── Entry: vectorized breakout detection ───────────────────────────
-            # argmax on a bool array returns the index of the first True.
+            # ── Entry: find FIRST breakout bar, then check filters on that bar ──
+            # CRITICAL: mirrors bot.py _check_breakout which is called bar-by-bar.
+            # Bot: first bar where close > rng_high → check VWAP & surge → if any
+            # filter fails → STATUS_COMPLETED (day over, no retry).
+            # Wrong approach: combined mask (breakout & vwap & surge) lets the backtest
+            # skip a failing early breakout bar and cherry-pick a later "perfect" one
+            # that the bot would have missed after the first failure.
             close_vals  = scan_bars["close"].values
             vwap_vals   = scan_bars["_vwap"].values
             volume_vals = scan_bars["volume"].values
 
-            # Average per-bar volume during the ORB window (for surge gate)
             avg_orb_vol = orb_bars["volume"].mean() if not orb_bars.empty else 0.0
 
-            # Build filter masks — both default to all-True when the feature is off
-            if vwap_filter:
-                vwap_long_ok  = close_vals > vwap_vals
-                vwap_short_ok = close_vals < vwap_vals
-            else:
-                vwap_long_ok = vwap_short_ok = np.ones(len(scan_bars), dtype=bool)
+            # Step 1: first raw breakout in each direction (no filter masks yet)
+            raw_long_mask  = close_vals > rng_high
+            raw_short_mask = close_vals < rng_low
 
-            if volume_surge_mult > 0 and avg_orb_vol > 0:
-                surge_ok = volume_vals >= avg_orb_vol * volume_surge_mult
-            else:
-                surge_ok = np.ones(len(scan_bars), dtype=bool)
+            has_raw_long  = raw_long_mask.any()
+            has_raw_short = raw_short_mask.any()
 
-            long_mask  = (close_vals > rng_high) & vwap_long_ok  & surge_ok
-            short_mask = (close_vals < rng_low)  & vwap_short_ok & surge_ok
-
-            has_long  = long_mask.any()
-            has_short = short_mask.any()
-
-            if not has_long and not has_short:
-                close_min = close_vals.min()
-                close_max = close_vals.max()
+            if not has_raw_long and not has_raw_short:
                 result.skipped_days.append(SkippedDay(
                     date=date_str, reason="NO_SIGNAL",
                     detail=f"Price stayed inside ORB [{rng_low:.2f} – {rng_high:.2f}] "
-                           f"all day. Session range: {close_min:.2f} – {close_max:.2f}.",
+                           f"all day. Session range: {close_vals.min():.2f} – {close_vals.max():.2f}.",
                 ))
                 continue
 
-            long_iloc  = int(long_mask.argmax())  if has_long  else len(scan_bars)
-            short_iloc = int(short_mask.argmax()) if has_short else len(scan_bars)
+            raw_long_iloc  = int(raw_long_mask.argmax())  if has_raw_long  else len(scan_bars)
+            raw_short_iloc = int(raw_short_mask.argmax()) if has_raw_short else len(scan_bars)
 
-            if long_iloc <= short_iloc:
-                side, entry_iloc = "LONG", long_iloc
+            # Step 2: pick the direction whose raw breakout came first
+            if raw_long_iloc <= raw_short_iloc:
+                side, entry_iloc = "LONG", raw_long_iloc
             else:
-                side, entry_iloc = "SHORT", short_iloc
+                side, entry_iloc = "SHORT", raw_short_iloc
+
+            # Step 3: check confirmation filters on THAT bar only
+            bar_close  = close_vals[entry_iloc]
+            bar_vwap   = vwap_vals[entry_iloc]
+            bar_volume = volume_vals[entry_iloc]
+
+            if vwap_filter:
+                if side == "LONG" and bar_close <= bar_vwap:
+                    result.skipped_days.append(SkippedDay(
+                        date=date_str, reason="NO_SIGNAL",
+                        detail=f"VWAP filter: LONG close={bar_close:.2f} ≤ vwap={bar_vwap:.2f} on first breakout bar.",
+                    ))
+                    continue
+                if side == "SHORT" and bar_close >= bar_vwap:
+                    result.skipped_days.append(SkippedDay(
+                        date=date_str, reason="NO_SIGNAL",
+                        detail=f"VWAP filter: SHORT close={bar_close:.2f} ≥ vwap={bar_vwap:.2f} on first breakout bar.",
+                    ))
+                    continue
+
+            if volume_surge_mult > 0 and avg_orb_vol > 0:
+                if bar_volume < avg_orb_vol * volume_surge_mult:
+                    result.skipped_days.append(SkippedDay(
+                        date=date_str, reason="NO_SIGNAL",
+                        detail=f"Volume surge: bar vol {bar_volume:,.0f} < "
+                               f"{volume_surge_mult:.1f}×avg_orb {avg_orb_vol:,.0f} on first breakout bar.",
+                    ))
+                    continue
 
             entry_bar  = scan_bars.iloc[entry_iloc]
             # Entry fills at the ORB boundary (stop-limit order), not the breakout bar close
@@ -474,7 +497,7 @@ class BacktestEngine:
                     tp_i = int(tp_hit.argmax()) if tp_hit.any() else len(after_entry)
                     sl_i = int(sl_hit.argmax()) if sl_hit.any() else len(after_entry)
 
-                    if tp_hit.any() and tp_i <= sl_i:
+                    if tp_hit.any() and tp_i < sl_i:
                         exit_reason = "TP"
                         exit_row    = after_entry.iloc[tp_i]
                         exit_px     = round(tp1_px - slip, 2) if side == "LONG" else round(tp1_px + slip, 2)
@@ -519,7 +542,7 @@ class BacktestEngine:
                     tp1_i = int(tp1_hit.argmax()) if tp1_hit.any() else len(after_entry)
                     sl_i  = int(sl_hit.argmax())  if sl_hit.any()  else len(after_entry)
 
-                    if tp1_hit.any() and tp1_i <= sl_i:
+                    if tp1_hit.any() and tp1_i < sl_i:
                         l1_reason = "TP1"
                         l1_row    = after_entry.iloc[tp1_i]
                         l1_px     = round(tp1_px - slip, 2) if side == "LONG" else round(tp1_px + slip, 2)
@@ -570,7 +593,7 @@ class BacktestEngine:
                         tp2_i = int(tp2_hit.argmax()) if tp2_hit.any() else len(after_tp1)
                         be_i  = int(be_hit.argmax())  if be_hit.any()  else len(after_tp1)
 
-                        if tp2_hit.any() and tp2_i <= be_i:
+                        if tp2_hit.any() and tp2_i < be_i:
                             l2_reason = "TP2"
                             l2_row    = after_tp1.iloc[tp2_i]
                             l2_px     = round(tp2_px - slip, 2) if side == "LONG" else round(tp2_px + slip, 2)

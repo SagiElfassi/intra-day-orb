@@ -23,6 +23,7 @@ load_dotenv(dotenv_path=".env")
 
 import subprocess
 import sys
+import streamlit.components.v1 as st_components
 
 DB_PATH      = os.environ.get("DB_PATH", "orb_trades.db")
 CONFIG_PATH  = "live_config.json"
@@ -935,6 +936,61 @@ with _acct_c11:
 
 selected_date_str = str(selected_date)
 
+# ── Market clock / candle stopwatch ──────────────────────────────────────────
+st_components.html("""
+<div id="orb-clock" style="
+    font-family: monospace;
+    font-size: 0.82em;
+    color: #aaa;
+    padding: 2px 0 0 4px;
+    letter-spacing: 0.03em;
+">⏳ Loading...</div>
+<script>
+(function() {
+    function pad(n) { return String(n).padStart(2, '0'); }
+    function tick() {
+        var now = new Date();
+        // Convert to EST/EDT
+        var est = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+        var h = est.getHours(), m = est.getMinutes(), s = est.getSeconds();
+
+        var open = new Date(est);
+        open.setHours(9, 30, 0, 0);
+        var close = new Date(est);
+        close.setHours(16, 0, 0, 0);
+
+        var diff = est - open; // ms since 9:30
+
+        var curTime = pad(h) + ':' + pad(m) + ':' + pad(s) + ' EST';
+
+        if (diff < 0) {
+            var toOpen = -diff;
+            var th = Math.floor(toOpen / 3600000);
+            var tm = Math.floor((toOpen % 3600000) / 60000);
+            var ts = Math.floor((toOpen % 60000) / 1000);
+            document.getElementById('orb-clock').innerHTML =
+                curTime + ' &nbsp;|&nbsp; ⏰ Market opens in ' +
+                (th > 0 ? th + 'h ' : '') + tm + 'm ' + ts + 's';
+        } else if (est > close) {
+            document.getElementById('orb-clock').innerHTML =
+                curTime + ' &nbsp;|&nbsp; 🔒 Market closed';
+        } else {
+            var elH = Math.floor(diff / 3600000);
+            var elM = Math.floor((diff % 3600000) / 60000);
+            var elS = Math.floor((diff % 60000) / 1000);
+            var nextCandle = 60 - s;
+            var elapsed = (elH > 0 ? elH + 'h ' : '') + elM + 'm ' + pad(elS) + 's';
+            document.getElementById('orb-clock').innerHTML =
+                curTime + ' &nbsp;|&nbsp; 🕐 Since open: ' + elapsed +
+                ' &nbsp;|&nbsp; ⏱ Next candle: ' + nextCandle + 's';
+        }
+    }
+    tick();
+    setInterval(tick, 1000);
+})();
+</script>
+""", height=28)
+
 st.divider()
 
 # ── Row 1: trading params ─────────────────────────────────────────────────────
@@ -1137,7 +1193,8 @@ tab_live, tab_bt, tab_scanner, tab_rules = st.tabs([
 
 # ── TAB 1 : LIVE ──────────────────────────────────────────────────────────────
 
-with tab_live:
+@st.fragment(run_every=60)
+def render_live_tab():
     trades_df = q_trades(selected_date_str)
     ranges_df = q_ranges(selected_date_str)
     events_df = q_events(selected_date_str)
@@ -1304,6 +1361,10 @@ with tab_live:
         else:
             st.dataframe(events_df[["timestamp", "event_type", "message"]],
                          use_container_width=True, hide_index=True)
+
+
+with tab_live:
+    render_live_tab()
 
 
 # ── TAB 2 : BACKTEST ──────────────────────────────────────────────────────────

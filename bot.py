@@ -1482,6 +1482,9 @@ class ORBBot:
             logger.error("Post-reconnect resync failed: %s", exc)
             return
 
+        # Backfill bars missed during the disconnect gap
+        await self._backfill_missing_bars(loop)
+
         _live = (STATUS_IN_TRADE, STATUS_PARTIAL_EXIT, STATUS_BREAK_EVEN)
         for symbol, state in self.states.items():
             async with state.lock:
@@ -1498,11 +1501,51 @@ class ORBBot:
                         await self.db.log_event("RESYNC", f"{symbol}: closed during disconnect")
 
                 elif state.status == STATUS_WAITING and state.range_high is None:
-                    # Re-seed ORB range from DB bars so the bot can watch for breakouts
-                    # after a missed ORB window (e.g., reconnect after connection-limit error)
                     await self._seed_range_from_bars(symbol, state)
 
         logger.info("Resync complete. Open: %s", list(open_symbols))
+
+    async def _backfill_missing_bars(self, loop):
+        """Fetch bars missed during a WebSocket gap and replay them through on_bar."""
+        now = datetime.now(timezone.utc)
+        # Only backfill during market hours
+        now_est = now.astimezone(self.config.tz)
+        mkt_open  = now_est.replace(hour=9,  minute=30, second=0, microsecond=0)
+        mkt_close = now_est.replace(hour=16, minute=0,  second=0, microsecond=0)
+        if not (mkt_open <= now_est <= mkt_close):
+            return
+        if self._last_bar_time == 0.0:
+            return
+
+        gap_start = datetime.fromtimestamp(self._last_bar_time, tz=timezone.utc)
+        gap_secs  = (now - gap_start).total_seconds()
+        if gap_secs < 90:   # less than 1.5 min — nothing to backfill
+            return
+
+        logger.info("Backfilling %.0fs gap (%s → now) for %s",
+                    gap_secs, gap_start.strftime("%H:%M:%S"), list(self.active_symbols))
+        try:
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame
+            req = StockBarsRequest(
+                symbol_or_symbols=list(self.active_symbols),
+                timeframe=TimeFrame.Minute,
+                start=gap_start,
+                end=now,
+                feed=self.config.data_feed,
+            )
+            bars_resp = await loop.run_in_executor(
+                None, lambda: self.historical_client.get_stock_bars(req)
+            )
+            replayed = 0
+            for sym, bar_list in bars_resp.items():
+                for bar in bar_list:
+                    await self.on_bar(bar)
+                    replayed += 1
+            if replayed:
+                logger.info("Backfilled %d bars across %d symbols", replayed, len(bars_resp))
+        except Exception as exc:
+            logger.warning("Bar backfill failed: %s", exc)
 
     async def _seed_range_from_bars(self, symbol: str, state: "TickerState"):
         """Load today's ORB bars from DB and set state to SCANNING if range is valid."""

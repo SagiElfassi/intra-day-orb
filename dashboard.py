@@ -781,6 +781,23 @@ def build_bt_day_chart(trade_row: pd.Series, day_bars: pd.DataFrame) -> go.Figur
     exit_reason = trade_row.get("exit_reason", "")
     leg1_reason = trade_row.get("leg1_exit", "")
 
+    side = trade_row.get("side", "LONG")
+    try:
+        fig.add_trace(go.Scatter(
+            x=[entry_ts], y=[float(entry)],
+            mode="markers",
+            marker=dict(
+                symbol="triangle-up" if side == "LONG" else "triangle-down",
+                size=14,
+                color="#82b1ff",
+                line=dict(color="#fff", width=1),
+            ),
+            name=f"Entry ({side})",
+            hovertemplate=f"Entry: {side}<br>$%{{y:.2f}}<extra></extra>",
+        ))
+    except Exception:
+        pass
+
     if scale_out_trade and leg1_reason == "TP1":
         try:
             fig.add_trace(go.Scatter(

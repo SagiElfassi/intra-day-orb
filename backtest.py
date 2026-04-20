@@ -77,7 +77,7 @@ class BacktestStats:
 @dataclass
 class SkippedDay:
     date: str
-    reason: str   # NO_BARS | INSUFFICIENT_BARS | ZERO_RANGE | NO_SIGNAL
+    reason: str   # NO_BARS | INSUFFICIENT_BARS | ZERO_RANGE | LOW_ORB_VOLUME | LOW_ATR | NO_SIGNAL
     detail: str   # human-readable explanation
 
 
@@ -175,14 +175,19 @@ class BacktestEngine:
         position_size_usd: float = 1000.0,
         slippage_bps: float = 0.0,
         feed: DataFeed = DataFeed.IEX,
-        # Dynamic Momentum params (0 = disabled → classic single-leg mode)
+        # Dynamic Momentum params
         tp1_r: float = 0.0,
         tp2_r: float = 0.0,
         risk_pct_equity: float = 0.0,
         starting_equity: float = 100_000.0,
-        # Momentum filters (match bot.py on_bar / _check_breakout logic)
+        # Momentum filters (match bot.py _check_breakout logic)
         vwap_filter: bool = False,
         volume_surge_mult: float = 0.0,
+        # Analyst filters (match bot.py _finalize_range logic)
+        min_orb_volume: int = 0,
+        min_atr_pct: float = 0.0,
+        # Position cap (match bot.py max_position_usd)
+        max_position_usd: float = 0.0,
     ) -> BacktestResult:
 
         result = BacktestResult(
@@ -209,6 +214,30 @@ class BacktestEngine:
             return result
 
         df["_date"] = df["timestamp"].dt.date
+
+        # ── Pre-compute 14-day rolling ATR% per trade date (matches bot.py _compute_atr) ──
+        _atr_by_date: dict = {}
+        if min_atr_pct > 0:
+            daily = (
+                df[df["timestamp"].dt.hour >= 9]
+                .groupby("_date")
+                .agg(daily_high=("high", "max"), daily_low=("low", "min"),
+                     daily_close=("close", "last"))
+                .reset_index()
+                .sort_values("_date")
+            )
+            daily["prev_close"] = daily["daily_close"].shift(1)
+            daily["tr"] = daily.apply(
+                lambda r: max(
+                    r["daily_high"] - r["daily_low"],
+                    abs(r["daily_high"] - r["prev_close"]) if pd.notna(r["prev_close"]) else 0,
+                    abs(r["daily_low"]  - r["prev_close"]) if pd.notna(r["prev_close"]) else 0,
+                ),
+                axis=1,
+            )
+            daily["atr14"] = daily["tr"].rolling(14, min_periods=1).mean()
+            daily["atr_pct"] = daily["atr14"] / daily["daily_close"] * 100
+            _atr_by_date = dict(zip(daily["_date"], daily["atr_pct"]))
 
         for trade_date, day_df in df.groupby("_date"):
             day_df   = day_df.sort_values("timestamp").reset_index(drop=True)
@@ -271,6 +300,25 @@ class BacktestEngine:
                     detail=f"ORB High == Low == {rng_high:.2f}. Range is flat — no trade possible.",
                 ))
                 continue
+
+            # ── Analyst filters (matches bot.py _finalize_range) ──────────────
+            if min_orb_volume > 0:
+                orb_vol = int(orb_bars["volume"].sum())
+                if orb_vol < min_orb_volume:
+                    result.skipped_days.append(SkippedDay(
+                        date=date_str, reason="LOW_ORB_VOLUME",
+                        detail=f"ORB volume {orb_vol:,} < min {min_orb_volume:,}.",
+                    ))
+                    continue
+
+            if min_atr_pct > 0:
+                atr_pct = _atr_by_date.get(trade_date, 0.0)
+                if atr_pct < min_atr_pct:
+                    result.skipped_days.append(SkippedDay(
+                        date=date_str, reason="LOW_ATR",
+                        detail=f"14-day ATR {atr_pct:.2f}% < min {min_atr_pct:.1f}%.",
+                    ))
+                    continue
 
             if scan_bars.empty:
                 result.skipped_days.append(SkippedDay(
@@ -352,6 +400,8 @@ class BacktestEngine:
                 total_qty   = max(2, math.floor(risk_dollar / risk_per_share))
             else:
                 total_qty   = max(1, math.floor(position_size_usd / entry_price))
+            if max_position_usd > 0:
+                total_qty   = min(total_qty, max(2, math.floor(max_position_usd / entry_price)))
 
             half_qty = total_qty // 2
             rem_qty  = total_qty - half_qty
@@ -365,11 +415,11 @@ class BacktestEngine:
                     tp1_px = round(entry_price - risk_per_share * tp1_r, 2)
                     tp2_px = round(entry_price - risk_per_share * tp2_r, 2)
             else:
-                # Classic mode: single TP based on ORB span × risk_ratio
+                # Single-leg mode: TP at risk_per_share × risk_ratio (R-multiple, consistent with scale-out)
                 if side == "LONG":
-                    tp1_px = tp2_px = round(entry_price + rng_span * risk_ratio, 2)
+                    tp1_px = tp2_px = round(entry_price + risk_per_share * risk_ratio, 2)
                 else:
-                    tp1_px = tp2_px = round(entry_price - rng_span * risk_ratio, 2)
+                    tp1_px = tp2_px = round(entry_price - risk_per_share * risk_ratio, 2)
 
             # Fee helper (regulatory pass-through, sell side only)
             def _fee(q: int, sell_px: float) -> float:

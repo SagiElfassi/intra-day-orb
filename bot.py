@@ -113,14 +113,20 @@ class Config:
             with open("live_config.json") as f:
                 saved = json.load(f)
             scalar_fields = [
-                ("min_orb_volume", int), ("min_atr_pct", float), ("max_spread_pct", float),
-                ("gap_min_pct", float),  ("rvol_min", float),    ("risk_pct_equity", float),
-                ("tp1_r", float),        ("tp2_r", float),       ("volume_surge_mult", float),
-                ("vwap_filter", bool),
+                ("min_orb_volume", int),    ("min_atr_pct", float),     ("max_spread_pct", float),
+                ("gap_min_pct", float),     ("rvol_min", float),        ("risk_pct_equity", float),
+                ("max_position_usd", float),("tp1_r", float),           ("tp2_r", float),
+                ("volume_surge_mult", float),("vwap_filter", bool),
             ]
             for attr, cast in scalar_fields:
                 if attr in saved:
                     setattr(self, attr, cast(saved[attr]))
+            if "symbols" in saved and isinstance(saved["symbols"], list):
+                self.symbols = [s.strip().upper() for s in saved["symbols"] if s.strip()]
+            if "orb_minutes" in saved:
+                self.orb_minutes = int(saved["orb_minutes"])
+            if "stop_loss_type" in saved:
+                self.stop_loss_type = str(saved["stop_loss_type"])
         except Exception:
             pass
 
@@ -151,9 +157,10 @@ class Config:
     max_spread_pct: float     = field(default_factory=lambda: float(os.environ.get("MAX_SPREAD_PCT", "0.05")))
 
     # Institutional risk management
-    risk_pct_equity: float = field(default_factory=lambda: float(os.environ.get("RISK_PCT_EQUITY", "1.0")))
-    tp1_r: float           = field(default_factory=lambda: float(os.environ.get("TP1_R", "1.0")))
-    tp2_r: float           = field(default_factory=lambda: float(os.environ.get("TP2_R", "3.0")))
+    risk_pct_equity: float  = field(default_factory=lambda: float(os.environ.get("RISK_PCT_EQUITY", "1.0")))
+    max_position_usd: float = field(default_factory=lambda: float(os.environ.get("MAX_POSITION_USD", "0")))
+    tp1_r: float            = field(default_factory=lambda: float(os.environ.get("TP1_R", "1.0")))
+    tp2_r: float            = field(default_factory=lambda: float(os.environ.get("TP2_R", "3.0")))
 
     # Legacy fixed size (kept for backtest compatibility; bot uses risk_pct_equity)
     position_size_usd: float = field(default_factory=lambda: float(os.environ.get("POSITION_SIZE_USD", "1000.0")))
@@ -874,6 +881,8 @@ class ORBBot:
 
         risk_dollar    = self.starting_equity * self.config.risk_pct_equity / 100.0
         total_qty      = max(2, math.floor(risk_dollar / risk_per_share))
+        if self.config.max_position_usd > 0:
+            total_qty  = min(total_qty, max(2, math.floor(self.config.max_position_usd / close)))
         half_qty       = total_qty // 2
         remaining_qty  = total_qty - half_qty
 
@@ -1467,7 +1476,14 @@ async def _shutdown(bot: ORBBot):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.pid")
+
+
 def main():
+    # Write PID so the dashboard can restart us cleanly
+    with open(PID_FILE, "w") as _f:
+        _f.write(str(os.getpid()))
+
     config = Config()
     bot    = ORBBot(config)
 
@@ -1488,6 +1504,10 @@ def main():
         pass
     finally:
         logger.info("Bot shut down.")
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

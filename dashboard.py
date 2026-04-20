@@ -370,6 +370,35 @@ def apply_rangebreaks(fig: go.Figure, rows: int = 1):
 
 # ── Chart builder ──────────────────────────────────────────────────────────────
 
+def _compute_vwap(bars: pd.DataFrame) -> pd.Series:
+    """Cumulative VWAP from 9:30 AM on market-hours bars."""
+    mkt = bars[
+        ((bars["timestamp"].dt.hour == 9)  & (bars["timestamp"].dt.minute >= 30)) |
+        (bars["timestamp"].dt.hour >= 10)
+    ].copy()
+    if mkt.empty:
+        return pd.Series(dtype=float)
+    mkt["typical"] = (mkt["high"] + mkt["low"] + mkt["close"]) / 3
+    mkt["cum_tp_vol"] = (mkt["typical"] * mkt["volume"]).cumsum()
+    mkt["cum_vol"]    = mkt["volume"].cumsum()
+    mkt["vwap"]       = mkt["cum_tp_vol"] / mkt["cum_vol"]
+    return mkt.set_index("timestamp")["vwap"]
+
+
+def _orb_from_bars(bars: pd.DataFrame, orb_minutes: int) -> dict | None:
+    """Compute ORB high/low/mid from bars when not stored in DB."""
+    orb = bars[
+        (bars["timestamp"].dt.hour == 9) &
+        (bars["timestamp"].dt.minute >= 30) &
+        (bars["timestamp"].dt.minute < 30 + orb_minutes)
+    ]
+    if len(orb) < max(1, orb_minutes * 6 // 10):  # need >=60% of expected bars
+        return None
+    rh = float(orb["high"].max())
+    rl = float(orb["low"].min())
+    return {"range_high": rh, "range_low": rl, "range_mid": round((rh + rl) / 2, 4), "computed": True}
+
+
 def build_live_chart(
     symbol: str,
     bars: pd.DataFrame,
@@ -406,19 +435,39 @@ def build_live_chart(
         marker_color=v_colors, showlegend=False, name="Vol",
     ), row=2, col=1)
 
+    # VWAP line
+    vwap = _compute_vwap(bars)
+    if not vwap.empty:
+        fig.add_trace(go.Scatter(
+            x=vwap.index, y=vwap.values,
+            mode="lines", name="VWAP",
+            line=dict(color="#ab47bc", width=1.5, dash="dot"),
+        ), row=1, col=1)
+
     x0 = bars["timestamp"].iloc[0]
     x1 = bars["timestamp"].iloc[-1]
 
+    # Use stored ORB range or fall back to computing from bars
+    orb_data = None
     if orb is not None:
+        orb_data = orb
+    else:
+        orb_data = _orb_from_bars(bars, orb_minutes)
+
+    if orb_data is not None:
+        rh  = float(orb_data["range_high"])
+        rl  = float(orb_data["range_low"])
+        rm  = float(orb_data["range_mid"])
+        tag = " *" if isinstance(orb_data, dict) and orb_data.get("computed") else ""
         fig.add_shape(type="rect", x0=x0, x1=x1,
-                      y0=orb["range_low"], y1=orb["range_high"],
+                      y0=rl, y1=rh,
                       line=dict(color="rgba(255,214,0,.6)", width=1),
                       fillcolor="rgba(255,214,0,.06)", layer="below",
                       row=1, col=1)
         for level, label, color in [
-            (orb["range_high"], f"ORB High  {orb['range_high']:.2f}", "#FFD700"),
-            (orb["range_low"],  f"ORB Low   {orb['range_low']:.2f}",  "#FFA000"),
-            (orb["range_mid"],  f"Mid       {orb['range_mid']:.2f}",  "#FFCC44"),
+            (rh, f"ORB High{tag}  {rh:.2f}", "#FFD700"),
+            (rl, f"ORB Low{tag}   {rl:.2f}",  "#FFA000"),
+            (rm, f"Mid{tag}       {rm:.2f}",  "#FFCC44"),
         ]:
             fig.add_hline(y=level, line_dash="dot", line_color=color,
                           annotation_text=label, annotation_position="right",
@@ -1275,6 +1324,12 @@ def render_live_tab():
         bars    = q_bars(sym, selected_date_str)
         orb_row = (ranges_df[ranges_df["symbol"] == sym].iloc[0]
                    if not ranges_df.empty and sym in ranges_df["symbol"].values else None)
+        # Fall back to computing range from bars when not stored in DB
+        _bars_all = q_bars(sym, selected_date_str)  # includes pre-market for VWAP/ORB calc
+        _orb_computed = None
+        if orb_row is None and not _bars_all.empty:
+            _orb_computed = _orb_from_bars(_bars_all, orb_minutes)
+
         sym_trades = (trades_df[trades_df["symbol"] == sym]
                       if not trades_df.empty and sym in trades_df["symbol"].values
                       else pd.DataFrame())
@@ -1287,7 +1342,7 @@ def render_live_tab():
 
         with col_chart:
             st.plotly_chart(
-                build_live_chart(sym, bars, orb_row, live_trade, orb_minutes),
+                build_live_chart(sym, bars, orb_row if orb_row is not None else _orb_computed, live_trade, orb_minutes),
                 use_container_width=True,
             )
 
@@ -1300,12 +1355,15 @@ def render_live_tab():
                 for _, t in sym_trades.iterrows():
                     render_trade_card(t, None)
             else:
-                orb_status = "✅ Range set — scanning" if orb_row is not None else "⏳ Waiting for 9:30 AM ORB window"
+                _effective_orb = orb_row if orb_row is not None else _orb_computed
+                orb_status = ("✅ Range set — scanning" if orb_row is not None
+                              else "⚠️ Range computed from bars (bot reconnecting)" if _orb_computed
+                              else "⏳ Waiting for 9:30 AM ORB window")
                 st.info(orb_status)
-                if orb_row is not None:
-                    _rh  = float(orb_row['range_high'])
-                    _rl  = float(orb_row['range_low'])
-                    _rm  = float(orb_row['range_mid'])
+                if _effective_orb is not None:
+                    _rh  = float(_effective_orb['range_high'])
+                    _rl  = float(_effective_orb['range_low'])
+                    _rm  = float(_effective_orb['range_mid'])
                     _span = _rh - _rl
 
                     st.markdown(f"""

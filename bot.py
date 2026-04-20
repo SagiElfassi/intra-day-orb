@@ -371,6 +371,35 @@ class DatabaseManager:
             )
             await db.commit()
 
+    async def fetch_orb_bars(self, symbol: str, today: str, orb_end_minute: int) -> list:
+        """Return bars from 9:30 AM up to orb_end_minute for range seeding."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """SELECT high, low, close, volume FROM price_bars
+                   WHERE symbol=? AND DATE(timestamp)=?
+                     AND (strftime('%H','timestamp') = '09'
+                          AND CAST(strftime('%M','timestamp') AS INTEGER) BETWEEN 30 AND ?)
+                   ORDER BY timestamp""",
+                (symbol, today, orb_end_minute - 1),
+            )
+            return [dict(r) for r in await cursor.fetchall()]
+
+    async def fetch_all_bars_today(self, symbol: str, today: str) -> list:
+        """Return all bars for today at or after 9:30 AM for VWAP reconstruction."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """SELECT high, low, close, volume FROM price_bars
+                   WHERE symbol=? AND DATE(timestamp)=?
+                     AND (strftime('%H','timestamp') > '09'
+                          OR (strftime('%H','timestamp') = '09'
+                              AND CAST(strftime('%M','timestamp') AS INTEGER) >= 30))
+                   ORDER BY timestamp""",
+                (symbol, today),
+            )
+            return [dict(r) for r in await cursor.fetchall()]
+
     async def load_active_trades(self, today: str) -> List[dict]:
         """Return today's trades that were still open at last shutdown."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -1315,20 +1344,59 @@ class ORBBot:
         _live = (STATUS_IN_TRADE, STATUS_PARTIAL_EXIT, STATUS_BREAK_EVEN)
         for symbol, state in self.states.items():
             async with state.lock:
-                if state.status not in _live:
-                    continue
-                trade_db_id = state.trade_db_id
-                if symbol not in open_symbols:
-                    logger.warning("%s | Position closed during disconnect — COMPLETED", symbol)
-                    state.status = STATUS_COMPLETED
-                    if trade_db_id:
-                        await self.db.update_trade(
-                            trade_db_id, status="CLOSED_MANUAL",
-                            closed_at=datetime.now(timezone.utc).isoformat(),
-                        )
-                    await self.db.log_event("RESYNC", f"{symbol}: closed during disconnect")
+                if state.status in _live:
+                    trade_db_id = state.trade_db_id
+                    if symbol not in open_symbols:
+                        logger.warning("%s | Position closed during disconnect — COMPLETED", symbol)
+                        state.status = STATUS_COMPLETED
+                        if trade_db_id:
+                            await self.db.update_trade(
+                                trade_db_id, status="CLOSED_MANUAL",
+                                closed_at=datetime.now(timezone.utc).isoformat(),
+                            )
+                        await self.db.log_event("RESYNC", f"{symbol}: closed during disconnect")
+
+                elif state.status == STATUS_WAITING and state.range_high is None:
+                    # Re-seed ORB range from DB bars so the bot can watch for breakouts
+                    # after a missed ORB window (e.g., reconnect after connection-limit error)
+                    await self._seed_range_from_bars(symbol, state)
 
         logger.info("Resync complete. Open: %s", list(open_symbols))
+
+    async def _seed_range_from_bars(self, symbol: str, state: "TickerState"):
+        """Load today's ORB bars from DB and set state to SCANNING if range is valid."""
+        try:
+            today = datetime.now(self.config.tz).strftime("%Y-%m-%d")
+            orb_end_min = 30 + self.config.orb_minutes
+            rows = await self.db.fetch_orb_bars(symbol, today, orb_end_min)
+            if len(rows) < max(1, self.config.orb_minutes * 6 // 10):
+                return
+            highs  = [r["high"]   for r in rows]
+            lows   = [r["low"]    for r in rows]
+            vols   = [float(r["volume"]) for r in rows]
+            closes = [r["close"]  for r in rows]
+            state.range_high     = max(highs)
+            state.range_low      = min(lows)
+            state.range_mid      = (state.range_high + state.range_low) / 2
+            state.avg_orb_volume = sum(vols) / len(vols)
+            # Reconstruct VWAP from all bars in DB for today
+            all_rows = await self.db.fetch_all_bars_today(symbol, today)
+            for r in all_rows:
+                typical = (r["high"] + r["low"] + r["close"]) / 3.0
+                state.vwap_num += typical * float(r["volume"])
+                state.vwap_den += float(r["volume"])
+            state.status = STATUS_SCANNING
+            logger.info(
+                "%s | Range re-seeded from DB — H=%.2f L=%.2f Mid=%.2f (bars=%d)",
+                symbol, state.range_high, state.range_low, state.range_mid, len(rows),
+            )
+            await self.db.save_orb_range(
+                symbol, today,
+                state.range_high, state.range_low, state.range_mid,
+                len(rows), True,
+            )
+        except Exception as exc:
+            logger.warning("%s | _seed_range_from_bars failed: %s", symbol, exc)
 
     async def _heartbeat_watchdog(self):
         while not self.kill_switch_triggered:

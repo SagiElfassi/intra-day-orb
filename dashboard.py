@@ -34,23 +34,24 @@ REFRESH_SEC  = 10
 
 
 def _kill_all_bots(project_dir: str) -> list[int]:
-    """Kill every pythonw.exe process running bot.py. Returns list of killed PIDs."""
+    """Kill every python/pythonw process running bot.py. Returns list of killed PIDs."""
     killed = []
-    try:
-        out = subprocess.check_output(
-            ["wmic", "process", "where", "name='pythonw.exe'", "get", "ProcessId,CommandLine"],
-            timeout=8,
-        ).decode("utf-16-le", errors="replace")
-        for line in out.splitlines():
-            if "bot.py" in line:
-                parts = line.strip().rsplit(None, 1)
-                if parts and parts[-1].isdigit():
-                    pid = int(parts[-1])
-                    subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                                   capture_output=True, timeout=5)
-                    killed.append(pid)
-    except Exception:
-        pass
+    for exe in ("pythonw.exe", "python.exe"):
+        try:
+            out = subprocess.check_output(
+                ["wmic", "process", "where", f"name='{exe}'", "get", "ProcessId,CommandLine"],
+                timeout=8,
+            ).decode("utf-16-le", errors="replace")
+            for line in out.splitlines():
+                if "bot.py" in line:
+                    parts = line.strip().rsplit(None, 1)
+                    if parts and parts[-1].isdigit():
+                        pid = int(parts[-1])
+                        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                       capture_output=True, timeout=5)
+                        killed.append(pid)
+        except Exception:
+            pass
     # Also kill whatever is in the PID file (covers edge cases)
     pid_path = os.path.join(project_dir, PID_FILE)
     if os.path.exists(pid_path):

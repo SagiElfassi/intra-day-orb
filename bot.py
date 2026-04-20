@@ -37,9 +37,12 @@ import asyncio
 import logging
 import math
 import os
+import smtplib
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -179,6 +182,11 @@ class Config:
     )
     db_path: str = field(default_factory=lambda: os.environ.get("DB_PATH", "orb_trades.db"))
     tz: ZoneInfo = field(default_factory=lambda: ZoneInfo("America/New_York"))
+
+    # Email notifications
+    email_sender:    str = field(default_factory=lambda: os.environ.get("EMAIL_SENDER", ""))
+    email_password:  str = field(default_factory=lambda: os.environ.get("EMAIL_PASSWORD", ""))
+    email_recipient: str = field(default_factory=lambda: os.environ.get("EMAIL_RECIPIENT", ""))
 
 
 # ── Per-Symbol State ───────────────────────────────────────────────────────────
@@ -977,6 +985,10 @@ class ORBBot:
                 f"TP1={tp1} TP2={tp2} SL={sl} "
                 f"leg1={order1.id} leg2={order2.id}",
             )
+            await self._email_entry(
+                state.symbol, signal, total_qty, close, sl,
+                tp1 if self.config.tp1_r > 0 else None, tp2, risk_dollar,
+            )
 
         except Exception as exc:
             state.status = STATUS_COMPLETED
@@ -1056,6 +1068,14 @@ class ORBBot:
             self.kill_switch_triggered = True
             await self.db.log_event("KILL_SWITCH", f"Loss {loss_pct:.2f}%")
             await self._flatten_all_positions(reason="KILL_SWITCH")
+            mode = "PAPER" if self.config.paper else "LIVE"
+            await self._send_email(
+                f"[ORB {mode}] KILL SWITCH — Daily loss {loss_pct:.2f}%",
+                f"<h2 style='color:#ef5350'>Kill Switch Triggered</h2>"
+                f"<p>Daily loss <b>{loss_pct:.2f}%</b> exceeded threshold "
+                f"<b>{self.config.max_daily_loss_pct:.2f}%</b>. All positions flattened.</p>"
+                f"<p>{datetime.now(self.config.tz).strftime('%Y-%m-%d %H:%M EST')}</p>",
+            )
 
     async def _flatten_all_positions(self, reason: str):
         logger.warning("Flattening all positions — reason: %s", reason)
@@ -1066,6 +1086,123 @@ class ORBBot:
             )
         except Exception as exc:
             logger.error("Failed to flatten: %s", exc)
+
+    # ── Email Notifications ────────────────────────────────────────────────────
+
+    def _email_configured(self) -> bool:
+        return bool(self.config.email_sender and self.config.email_password and self.config.email_recipient)
+
+    def _send_email_sync(self, subject: str, html: str):
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = self.config.email_sender
+        msg["To"]      = self.config.email_recipient
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP("smtp.gmail.com", 587) as s:
+            s.starttls()
+            s.login(self.config.email_sender, self.config.email_password)
+            s.sendmail(self.config.email_sender, self.config.email_recipient, msg.as_string())
+
+    async def _send_email(self, subject: str, html: str):
+        if not self._email_configured():
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, self._send_email_sync, subject, html)
+            logger.debug("Email sent: %s", subject)
+        except Exception as exc:
+            logger.warning("Email failed: %s", exc)
+
+    async def _email_entry(self, symbol: str, signal: str, qty: int, entry: float,
+                           sl: float, tp1: float | None, tp2: float, risk_dollar: float):
+        mode  = "PAPER" if self.config.paper else "LIVE"
+        color = "#26a69a" if signal == "LONG" else "#ef5350"
+        arrow = "&#9650;" if signal == "LONG" else "&#9660;"
+        tp1_row = f"<tr><td>TP1</td><td>${tp1:.2f}</td></tr>" if tp1 else ""
+        html = f"""
+        <div style="font-family:monospace;max-width:480px">
+          <h2 style="color:{color}">{arrow} {signal} Entry — {symbol} [{mode}]</h2>
+          <table style="border-collapse:collapse;width:100%">
+            <tr><td><b>Symbol</b></td><td>{symbol}</td></tr>
+            <tr><td><b>Side</b></td><td>{signal}</td></tr>
+            <tr><td><b>Qty</b></td><td>{qty} shares</td></tr>
+            <tr><td><b>Entry</b></td><td>${entry:.2f}</td></tr>
+            <tr><td><b>Stop Loss</b></td><td>${sl:.2f}</td></tr>
+            {tp1_row}
+            <tr><td><b>TP2</b></td><td>${tp2:.2f}</td></tr>
+            <tr><td><b>Risk $</b></td><td>${risk_dollar:.2f}</td></tr>
+            <tr><td><b>Time</b></td><td>{datetime.now(self.config.tz).strftime('%H:%M:%S EST')}</td></tr>
+          </table>
+        </div>"""
+        await self._send_email(f"[ORB {mode}] {arrow} {signal} {symbol} @ ${entry:.2f}", html)
+
+    async def _email_exit(self, symbol: str, event: str, fill: float,
+                          pnl: float, total_pnl: float | None = None):
+        mode   = "PAPER" if self.config.paper else "LIVE"
+        labels = {
+            "TP1_HIT":   ("TP1 Hit",        "#26a69a"),
+            "TP2_HIT":   ("TP2 Hit - Full", "#00e676"),
+            "CLOSED_SL": ("Stop Loss Hit",  "#ef5350"),
+            "CLOSED_BE": ("Break-Even Stop","#ff9800"),
+        }
+        label, color = labels.get(event, (event, "#90a4ae"))
+        total_row = f"<tr><td><b>Total PnL</b></td><td style='color:{'#26a69a' if (total_pnl or 0)>=0 else '#ef5350'}'><b>${total_pnl:+.2f}</b></td></tr>" if total_pnl is not None else ""
+        pnl_color = "#26a69a" if pnl >= 0 else "#ef5350"
+        html = f"""
+        <div style="font-family:monospace;max-width:480px">
+          <h2 style="color:{color}">{label} — {symbol} [{mode}]</h2>
+          <table style="border-collapse:collapse;width:100%">
+            <tr><td><b>Symbol</b></td><td>{symbol}</td></tr>
+            <tr><td><b>Exit Price</b></td><td>${fill:.2f}</td></tr>
+            <tr><td><b>Leg PnL</b></td><td style="color:{pnl_color}">${pnl:+.2f}</td></tr>
+            {total_row}
+            <tr><td><b>Time</b></td><td>{datetime.now(self.config.tz).strftime('%H:%M:%S EST')}</td></tr>
+          </table>
+        </div>"""
+        emoji = "+" if pnl >= 0 else "-"
+        await self._send_email(f"[ORB {mode}] {label} {symbol} ${pnl:+.2f}", html)
+
+    async def _email_eod_summary(self, today: str):
+        if not self._email_configured():
+            return
+        mode = "PAPER" if self.config.paper else "LIVE"
+        try:
+            import aiosqlite as _aio
+            async with _aio.connect(self.config.db_path) as db:
+                db.row_factory = _aio.Row
+                cur = await db.execute(
+                    "SELECT * FROM trades WHERE date=? ORDER BY created_at", (today,)
+                )
+                trades = [dict(r) for r in await cur.fetchall()]
+        except Exception:
+            trades = []
+
+        total_pnl  = sum(float(t.get("realized_pnl") or 0) for t in trades)
+        wins       = [t for t in trades if float(t.get("realized_pnl") or 0) > 0]
+        losses     = [t for t in trades if float(t.get("realized_pnl") or 0) < 0]
+        pnl_color  = "#26a69a" if total_pnl >= 0 else "#ef5350"
+
+        rows = ""
+        for t in trades:
+            pnl  = float(t.get("realized_pnl") or 0)
+            c    = "#26a69a" if pnl > 0 else ("#ef5350" if pnl < 0 else "#90a4ae")
+            rows += (f"<tr><td>{t['symbol']}</td><td>{t['side']}</td>"
+                     f"<td>${float(t.get('entry_price') or 0):.2f}</td>"
+                     f"<td>{t.get('status','')}</td>"
+                     f"<td style='color:{c}'>${pnl:+.2f}</td></tr>")
+
+        html = f"""
+        <div style="font-family:monospace;max-width:600px">
+          <h2>End-of-Day Summary — {today} [{mode}]</h2>
+          <p style="font-size:1.4em;color:{pnl_color}"><b>Total PnL: ${total_pnl:+.2f}</b></p>
+          <p>{len(trades)} trades &nbsp;|&nbsp; {len(wins)} wins &nbsp;|&nbsp; {len(losses)} losses
+             &nbsp;|&nbsp; Win rate: {(len(wins)/len(trades)*100 if trades else 0):.0f}%</p>
+          <table style="border-collapse:collapse;width:100%;border:1px solid #444">
+            <tr style="background:#222"><th>Symbol</th><th>Side</th><th>Entry</th><th>Status</th><th>PnL</th></tr>
+            {rows if rows else '<tr><td colspan="5">No trades today</td></tr>'}
+          </table>
+        </div>"""
+        await self._send_email(f"[ORB {mode}] EOD Summary {today} | PnL ${total_pnl:+.2f}", html)
 
         _live = (STATUS_IN_TRADE, STATUS_PARTIAL_EXIT, STATUS_BREAK_EVEN)
         for state in self.states.values():
@@ -1169,6 +1306,7 @@ class ORBBot:
                                 await self.db.log_event(
                                     "TP1_HIT", f"{state.symbol} fill={fill_price:.4f} pnl={pnl1:.2f}"
                                 )
+                                await self._email_exit(state.symbol, "TP1_HIT", fill_price, pnl1)
                                 await self._move_sl_to_breakeven(state)
                                 async with state.lock:
                                     state.status = STATUS_BREAK_EVEN
@@ -1202,6 +1340,7 @@ class ORBBot:
                                 await self.db.log_event(
                                     "CLOSED_SL", f"{state.symbol} exit={fill_price:.4f}"
                                 )
+                                await self._email_exit(state.symbol, "CLOSED_SL", fill_price, total_pnl, total_pnl)
                             break
 
                     # ── STATUS_PARTIAL_EXIT / BREAK_EVEN ────────────────────
@@ -1238,6 +1377,7 @@ class ORBBot:
                                 await self.db.log_event(
                                     "CLOSED_BE", f"{state.symbol} exit={fill_price:.4f} total_pnl={total_pnl:.2f}"
                                 )
+                                await self._email_exit(state.symbol, "CLOSED_BE", fill_price, pnl_be, total_pnl)
                                 continue
 
                         # Check TP2 on order2
@@ -1275,6 +1415,7 @@ class ORBBot:
                                         "CLOSED_TP2",
                                         f"{state.symbol} exit={fill_price:.4f} total_pnl={total_pnl:.2f}",
                                     )
+                                    await self._email_exit(state.symbol, "TP2_HIT", fill_price, pnl_tp2, total_pnl)
                                     break
 
                 except Exception as exc:
@@ -1432,6 +1573,8 @@ class ORBBot:
         if not self.kill_switch_triggered:
             logger.info("Auto-flatten triggered (3:55 PM EST)")
             await self._flatten_all_positions(reason="AUTO_FLATTEN_3:55PM")
+        today = datetime.now(self.config.tz).strftime("%Y-%m-%d")
+        await self._email_eod_summary(today)
 
     async def _premarket_scanner_task(self):
         """

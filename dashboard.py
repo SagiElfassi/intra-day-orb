@@ -208,6 +208,7 @@ def load_config() -> dict:
         risk_pct_equity=1.0,
         tp1_r=1.0,
         tp2_r=3.0,
+        atr_sl_mult=1.5,
     )
     if os.path.exists(CONFIG_PATH):
         try:
@@ -1496,6 +1497,7 @@ with tab_bt:
                         min_orb_volume    = min_orb_volume,
                         min_atr_pct       = min_atr_pct,
                         max_position_usd  = float(max_position_usd),
+                        atr_sl_mult       = cfg.get("atr_sl_mult", 1.5),
                     )
 
                 if result.error:
@@ -1732,6 +1734,7 @@ with tab_scanner:
                         min_orb_volume    = min_orb_volume,
                         min_atr_pct       = min_atr_pct,
                         max_position_usd  = float(max_position_usd),
+                        atr_sl_mult       = cfg.get("atr_sl_mult", 1.5),
                     )
                     if result.error or not result.trades:
                         scan_rows.append({"Symbol": sym, "_no_trade": True,

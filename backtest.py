@@ -188,6 +188,11 @@ class BacktestEngine:
         min_atr_pct: float = 0.0,
         # Position cap (match bot.py max_position_usd)
         max_position_usd: float = 0.0,
+        # ATR stop-loss multiplier (match bot.py atr_sl_mult)
+        atr_sl_mult: float = 1.5,
+        # Time-of-day filter: no new entries after this time (match bot.py)
+        trading_window_end_hour: int = 10,
+        trading_window_end_minute: int = 30,
     ) -> BacktestResult:
 
         result = BacktestResult(
@@ -215,29 +220,30 @@ class BacktestEngine:
 
         df["_date"] = df["timestamp"].dt.date
 
-        # ── Pre-compute 14-day rolling ATR% per trade date (matches bot.py _compute_atr) ──
-        _atr_by_date: dict = {}
-        if min_atr_pct > 0:
-            daily = (
-                df[df["timestamp"].dt.hour >= 9]
-                .groupby("_date")
-                .agg(daily_high=("high", "max"), daily_low=("low", "min"),
-                     daily_close=("close", "last"))
-                .reset_index()
-                .sort_values("_date")
-            )
-            daily["prev_close"] = daily["daily_close"].shift(1)
-            daily["tr"] = daily.apply(
-                lambda r: max(
-                    r["daily_high"] - r["daily_low"],
-                    abs(r["daily_high"] - r["prev_close"]) if pd.notna(r["prev_close"]) else 0,
-                    abs(r["daily_low"]  - r["prev_close"]) if pd.notna(r["prev_close"]) else 0,
-                ),
-                axis=1,
-            )
-            daily["atr14"] = daily["tr"].rolling(14, min_periods=1).mean()
-            daily["atr_pct"] = daily["atr14"] / daily["daily_close"] * 100
-            _atr_by_date = dict(zip(daily["_date"], daily["atr_pct"]))
+        # ── Pre-compute 14-day rolling ATR per trade date ─────────────────────────
+        # Used for: (1) LOW_ATR filter, (2) ATR stop-loss calculation.
+        # Always computed so ATR SL works independently of min_atr_pct.
+        daily = (
+            df[df["timestamp"].dt.hour >= 9]
+            .groupby("_date")
+            .agg(daily_high=("high", "max"), daily_low=("low", "min"),
+                 daily_close=("close", "last"))
+            .reset_index()
+            .sort_values("_date")
+        )
+        daily["prev_close"] = daily["daily_close"].shift(1)
+        daily["tr"] = daily.apply(
+            lambda r: max(
+                r["daily_high"] - r["daily_low"],
+                abs(r["daily_high"] - r["prev_close"]) if pd.notna(r["prev_close"]) else 0,
+                abs(r["daily_low"]  - r["prev_close"]) if pd.notna(r["prev_close"]) else 0,
+            ),
+            axis=1,
+        )
+        daily["atr14"] = daily["tr"].rolling(14, min_periods=1).mean()
+        daily["atr_pct"] = daily["atr14"] / daily["daily_close"] * 100
+        _atr_by_date        = dict(zip(daily["_date"], daily["atr_pct"]))   # % (for filter)
+        _atr_dollar_by_date = dict(zip(daily["_date"], daily["atr14"]))     # $ (for SL calc)
 
         for trade_date, day_df in df.groupby("_date"):
             day_df   = day_df.sort_values("timestamp").reset_index(drop=True)
@@ -267,12 +273,22 @@ class BacktestEngine:
             day_df    = day_df.copy()
             day_df["_vwap"] = (_cum_tpv / _cum_vol.replace(0, np.nan)).ffill()
 
-            orb_bars  = day_df[
+            # Time-of-day filter: entries only before trading_window_end (matches bot.py)
+            window_end = mkt_open.replace(
+                hour=trading_window_end_hour,
+                minute=trading_window_end_minute,
+                second=0, microsecond=0,
+            )
+
+            orb_bars     = day_df[
                 (day_df["timestamp"] >= mkt_open) & (day_df["timestamp"] < orb_end)
             ]
-            scan_bars = day_df[
+            # all_post_orb: used for exit simulation (no time-of-day cap)
+            all_post_orb = day_df[
                 (day_df["timestamp"] >= orb_end) & (day_df["timestamp"] < flatten_at)
             ]
+            # scan_bars: entry-eligible only (capped at trading_window_end)
+            scan_bars    = all_post_orb[all_post_orb["timestamp"] < window_end]
 
             if len(orb_bars) == 0:
                 result.skipped_days.append(SkippedDay(
@@ -320,7 +336,7 @@ class BacktestEngine:
                     ))
                     continue
 
-            if scan_bars.empty:
+            if all_post_orb.empty or scan_bars.empty:
                 result.skipped_days.append(SkippedDay(
                     date=date_str, reason="NO_SIGNAL",
                     detail="No bars available after ORB window (early close or data gap).",
@@ -372,16 +388,23 @@ class BacktestEngine:
             else:
                 side, entry_iloc = "SHORT", short_iloc
 
-            entry_bar = scan_bars.iloc[entry_iloc]
-            close     = float(entry_bar["close"])
+            entry_bar  = scan_bars.iloc[entry_iloc]
+            # Entry fills at the ORB boundary (stop-limit order), not the breakout bar close
+            entry_stop  = rng_high if side == "LONG" else rng_low
+            slip        = round(entry_stop * slippage_bps / 10_000, 2)
+            entry_price = round(entry_stop + slip, 2) if side == "LONG" else round(entry_stop - slip, 2)
 
-            slip        = round(close * slippage_bps / 10_000, 2)
-            entry_price = round(close + slip, 2) if side == "LONG" else round(close - slip, 2)
-
-            if side == "LONG":
-                sl = round(rng_mid if stop_loss_type == "midpoint" else rng_low,  2)
-            else:
-                sl = round(rng_mid if stop_loss_type == "midpoint" else rng_high, 2)
+            if stop_loss_type == "atr":
+                atr_dollar = _atr_dollar_by_date.get(trade_date, 0.0)
+                if atr_dollar > 0:
+                    sl_dist = round(atr_dollar * atr_sl_mult, 2)
+                else:
+                    sl_dist = round((rng_high - rng_low) / 2, 2)  # fallback to midpoint distance
+                sl = round(entry_stop - sl_dist, 2) if side == "LONG" else round(entry_stop + sl_dist, 2)
+            elif stop_loss_type == "midpoint":
+                sl = round(rng_mid, 2)
+            else:  # hard
+                sl = round(rng_low if side == "LONG" else rng_high, 2)
 
             risk_per_share = abs(entry_price - sl)
             if risk_per_share <= 0:
@@ -406,20 +429,20 @@ class BacktestEngine:
             half_qty = total_qty // 2
             rem_qty  = total_qty - half_qty
 
-            # Target prices
+            # Target prices — bot.py uses ORB range (not risk_per_share) as the R unit
+            orb_range_r = rng_high - rng_low
             if scale_out:
                 if side == "LONG":
-                    tp1_px = round(entry_price + risk_per_share * tp1_r, 2)
-                    tp2_px = round(entry_price + risk_per_share * tp2_r, 2)
+                    tp1_px = round(entry_stop + orb_range_r * tp1_r, 2)
+                    tp2_px = round(entry_stop + orb_range_r * tp2_r, 2)
                 else:
-                    tp1_px = round(entry_price - risk_per_share * tp1_r, 2)
-                    tp2_px = round(entry_price - risk_per_share * tp2_r, 2)
+                    tp1_px = round(entry_stop - orb_range_r * tp1_r, 2)
+                    tp2_px = round(entry_stop - orb_range_r * tp2_r, 2)
             else:
-                # Single-leg mode: TP at risk_per_share × risk_ratio (R-multiple, consistent with scale-out)
                 if side == "LONG":
-                    tp1_px = tp2_px = round(entry_price + risk_per_share * risk_ratio, 2)
+                    tp1_px = tp2_px = round(entry_stop + orb_range_r * risk_ratio, 2)
                 else:
-                    tp1_px = tp2_px = round(entry_price - risk_per_share * risk_ratio, 2)
+                    tp1_px = tp2_px = round(entry_stop - orb_range_r * risk_ratio, 2)
 
             # Fee helper (regulatory pass-through, sell side only)
             def _fee(q: int, sell_px: float) -> float:
@@ -429,8 +452,9 @@ class BacktestEngine:
                     4,
                 )
 
-            # ── Exit: after_entry starts at entry_iloc+1 to avoid look-ahead ──
-            after_entry = scan_bars.iloc[entry_iloc + 1:]
+            # ── Exit: all post-ORB bars after entry timestamp (no time-of-day cap) ──
+            entry_ts    = entry_bar["timestamp"]
+            after_entry = all_post_orb[all_post_orb["timestamp"] > entry_ts]
 
             if not scale_out:
                 # ── Single-leg (classic ORB) ──────────────────────────────────

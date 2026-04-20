@@ -60,6 +60,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
 from alpaca.trading.requests import (
     MarketOrderRequest,
+    StopLimitOrderRequest,
     StopLossRequest,
     StopOrderRequest,
     TakeProfitRequest,
@@ -168,6 +169,16 @@ class Config:
     # Legacy fixed size (kept for backtest compatibility; bot uses risk_pct_equity)
     position_size_usd: float = field(default_factory=lambda: float(os.environ.get("POSITION_SIZE_USD", "1000.0")))
 
+    # Time-of-day filter — no new entries after this time
+    trading_window_end_hour:   int   = 10
+    trading_window_end_minute: int   = 30
+
+    # ATR stop-loss multiplier (used when stop_loss_type="atr")
+    atr_sl_mult: float = 1.5
+
+    # Stop-limit entry: limit_price offset from stop_price (fraction, e.g. 0.002 = 0.2%)
+    entry_limit_offset_pct: float = 0.002
+
     # Kill-switch + flatten
     max_daily_loss_pct: float = field(default_factory=lambda: float(os.environ.get("MAX_DAILY_LOSS_PCT", "2.0")))
     flatten_hour: int   = 15
@@ -237,6 +248,9 @@ class TickerState:
 
     # Partial-exit tracking
     realized_pnl_tp1: float = 0.0
+
+    # ATR (% of price) cached at range-finalization for use in SL calculation
+    atr_pct: float = 0.0
 
     # Pre-market scanner results (recorded for audit trail)
     gap_pct: float = 0.0
@@ -710,6 +724,27 @@ class ORBBot:
             if orb_start <= bar_time_est < orb_end:
                 await self._process_range_bar(state, bar, today)
             elif bar_time_est >= orb_end and state.status == STATUS_SCANNING:
+                # Time-of-day filter: no new entries after trading_window_end
+                window_end = bar_time_est.replace(
+                    hour=self.config.trading_window_end_hour,
+                    minute=self.config.trading_window_end_minute,
+                    second=0, microsecond=0,
+                )
+                if bar_time_est >= window_end:
+                    state.status = STATUS_COMPLETED
+                    logger.info(
+                        "%s | TIME FILTER: past %02d:%02d EST — no new entries",
+                        state.symbol,
+                        self.config.trading_window_end_hour,
+                        self.config.trading_window_end_minute,
+                    )
+                    await self.db.log_event(
+                        "FILTER_SKIP",
+                        f"{state.symbol}: TIME_OF_DAY (past "
+                        f"{self.config.trading_window_end_hour:02d}:"
+                        f"{self.config.trading_window_end_minute:02d})",
+                    )
+                    return
                 await self._check_breakout(state, bar, today)
 
     async def _process_range_bar(self, state: TickerState, bar: Bar, today: str):
@@ -747,8 +782,9 @@ class ORBBot:
             await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
             return
 
-        # ATR filter
+        # ATR filter — also cache for ATR-based stop-loss
         atr_pct = await self._fetch_atr_pct(state.symbol, state.range_high)
+        state.atr_pct = atr_pct
         if self.config.min_atr_pct > 0 and atr_pct < self.config.min_atr_pct:
             state.status = STATUS_INVALID
             reason = f"LOW_ATR ({atr_pct:.2f}% < {self.config.min_atr_pct:.1f}%)"
@@ -816,13 +852,13 @@ class ORBBot:
                 await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
                 return
 
-        # ── Spread filter ──────────────────────────────────────────────────────
+        # ── Spread filter — transient; retry next bar ──────────────────────────
         spread_pct = await self._fetch_spread_pct(state.symbol)
         if self.config.max_spread_pct > 0 and spread_pct > self.config.max_spread_pct:
-            state.status = STATUS_COMPLETED
-            reason = f"HIGH_SPREAD ({spread_pct:.4f}% > {self.config.max_spread_pct:.3f}%)"
-            logger.warning("%s | FILTER SKIP: %s", state.symbol, reason)
-            await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+            state.status = STATUS_SCANNING  # retry on next bar
+            reason = f"HIGH_SPREAD ({spread_pct:.4f}% > {self.config.max_spread_pct:.3f}%) — will retry"
+            logger.warning("%s | FILTER RETRY: %s", state.symbol, reason)
+            await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
             return
 
         logger.info(
@@ -871,11 +907,12 @@ class ORBBot:
                 None, lambda: self.historical_client.get_stock_latest_quote(req)
             )
             quote = resp[symbol]
-            ask   = float(quote.ask_price)
-            bid   = float(quote.bid_price)
-            if ask <= 0:
+            ask = float(quote.ask_price)
+            bid = float(quote.bid_price)
+            mid = (ask + bid) / 2.0
+            if mid <= 0:
                 return 0.0
-            return ((ask - bid) / ask) * 100
+            return ((ask - bid) / mid) * 100
         except Exception as exc:
             logger.warning("%s | Spread fetch failed (filter skipped): %s", symbol, exc)
             return 0.0
@@ -902,16 +939,33 @@ class ORBBot:
         orb_range = state.range_high - state.range_low
         side      = OrderSide.BUY if signal == "LONG" else OrderSide.SELL
 
+        # Stop-Limit entry prices
+        offset = self.config.entry_limit_offset_pct
         if signal == "LONG":
-            sl   = round(state.range_mid if self.config.stop_loss_type == "midpoint" else state.range_low,  2)
-            tp1  = round(close + orb_range * self.config.tp1_r, 2)
-            tp2  = round(close + orb_range * self.config.tp2_r, 2)
+            entry_stop  = round(state.range_high, 2)
+            entry_limit = round(state.range_high * (1 + offset), 2)
         else:
-            sl   = round(state.range_mid if self.config.stop_loss_type == "midpoint" else state.range_high, 2)
-            tp1  = round(close - orb_range * self.config.tp1_r, 2)
-            tp2  = round(close - orb_range * self.config.tp2_r, 2)
+            entry_stop  = round(state.range_low, 2)
+            entry_limit = round(state.range_low  * (1 - offset), 2)
 
-        risk_per_share = abs(close - sl)
+        # Stop-loss: midpoint | hard | atr
+        if self.config.stop_loss_type == "atr" and state.atr_pct > 0:
+            atr_dollar = (state.atr_pct / 100.0) * entry_stop
+            sl_dist    = round(atr_dollar * self.config.atr_sl_mult, 2)
+            sl = round(entry_stop - sl_dist, 2) if signal == "LONG" else round(entry_stop + sl_dist, 2)
+        elif self.config.stop_loss_type == "midpoint":
+            sl = round(state.range_mid if signal == "LONG" else state.range_mid, 2)
+        else:  # hard
+            sl = round(state.range_low if signal == "LONG" else state.range_high, 2)
+
+        if signal == "LONG":
+            tp1 = round(entry_stop + orb_range * self.config.tp1_r, 2)
+            tp2 = round(entry_stop + orb_range * self.config.tp2_r, 2)
+        else:
+            tp1 = round(entry_stop - orb_range * self.config.tp1_r, 2)
+            tp2 = round(entry_stop - orb_range * self.config.tp2_r, 2)
+
+        risk_per_share = abs(entry_stop - sl)
         if risk_per_share <= 0:
             state.status = STATUS_COMPLETED
             return
@@ -925,16 +979,18 @@ class ORBBot:
 
         entry_vwap = round(state.vwap_num / state.vwap_den, 4) if state.vwap_den > 0 else 0.0
 
-        req1 = MarketOrderRequest(
+        req1 = StopLimitOrderRequest(
             symbol=state.symbol, qty=half_qty, side=side,
             time_in_force=TimeInForce.DAY,
+            stop_price=entry_stop, limit_price=entry_limit,
             order_class=OrderClass.BRACKET,
             take_profit=TakeProfitRequest(limit_price=tp1),
             stop_loss=StopLossRequest(stop_price=sl),
         )
-        req2 = MarketOrderRequest(
+        req2 = StopLimitOrderRequest(
             symbol=state.symbol, qty=remaining_qty, side=side,
             time_in_force=TimeInForce.DAY,
+            stop_price=entry_stop, limit_price=entry_limit,
             order_class=OrderClass.BRACKET,
             take_profit=TakeProfitRequest(limit_price=tp2),
             stop_loss=StopLossRequest(stop_price=sl),
@@ -970,10 +1026,10 @@ class ORBBot:
             state.trade_db_id = trade_id
 
             logger.info(
-                "%s | ORDERS SUBMITTED  leg1=%s (×%d→TP1=%.2f)  "
-                "leg2=%s (×%d→TP2=%.2f)  SL=%.2f  "
-                "risk=$%.0f (%.1f%% equity)",
-                state.symbol,
+                "%s | ORDERS SUBMITTED  stop=%.2f limit=%.2f  "
+                "leg1=%s (x%d->TP1=%.2f)  leg2=%s (x%d->TP2=%.2f)  "
+                "SL=%.2f  risk=$%.0f (%.1f%% equity)",
+                state.symbol, entry_stop, entry_limit,
                 order1.id, half_qty,      tp1,
                 order2.id, remaining_qty, tp2,
                 sl,
@@ -986,7 +1042,7 @@ class ORBBot:
                 f"leg1={order1.id} leg2={order2.id}",
             )
             await self._email_entry(
-                state.symbol, signal, total_qty, close, sl,
+                state.symbol, signal, total_qty, entry_stop, sl,
                 tp1 if self.config.tp1_r > 0 else None, tp2, risk_dollar,
             )
 

@@ -1414,22 +1414,24 @@ class ORBBot:
     # ── Stream with Reconnection ───────────────────────────────────────────────
 
     async def _run_stream_with_reconnect(self):
-        backoff = 1
+        backoff = 5
         while not self.kill_switch_triggered:
             try:
                 logger.info("Connecting to Alpaca data stream…")
                 await self.stream._run_forever()
                 logger.warning("Stream ended — reconnecting…")
+                backoff = 5  # clean disconnect → reset backoff
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.error("Stream error: %s", exc)
+                # Do NOT reset backoff on error — let it grow so we stop hammering Alpaca
 
             if self.kill_switch_triggered:
                 break
             logger.info("Reconnecting in %ds…", backoff)
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            backoff = min(backoff * 2, 120)
 
             async with self._stream_reconnect_lock:
                 self.stream = StockDataStream(
@@ -1440,7 +1442,6 @@ class ORBBot:
                 self.stream.subscribe_bars(self.on_bar, *self.active_symbols)
 
             await self._resync_from_rest()
-            backoff = 1
 
     # ── Entry Point ────────────────────────────────────────────────────────────
 

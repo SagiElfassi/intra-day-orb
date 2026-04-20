@@ -33,92 +33,92 @@ EST          = ZoneInfo("America/New_York")
 REFRESH_SEC  = 10
 
 
-def restart_bot() -> str:
-    """Kill existing bot (via PID file) and start a fresh one. Returns status message."""
-    project_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # Kill old process
-    killed_pid = None
+def _kill_all_bots(project_dir: str) -> list[int]:
+    """Kill every pythonw.exe process running bot.py. Returns list of killed PIDs."""
+    killed = []
+    try:
+        out = subprocess.check_output(
+            ["wmic", "process", "where", "name='pythonw.exe'", "get", "ProcessId,CommandLine"],
+            timeout=8,
+        ).decode("utf-16-le", errors="replace")
+        for line in out.splitlines():
+            if "bot.py" in line:
+                parts = line.strip().rsplit(None, 1)
+                if parts and parts[-1].isdigit():
+                    pid = int(parts[-1])
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                   capture_output=True, timeout=5)
+                    killed.append(pid)
+    except Exception:
+        pass
+    # Also kill whatever is in the PID file (covers edge cases)
     pid_path = os.path.join(project_dir, PID_FILE)
     if os.path.exists(pid_path):
         try:
-            old_pid = int(open(pid_path).read().strip())
-            subprocess.run(["taskkill", "/F", "/PID", str(old_pid)],
-                           capture_output=True, timeout=5)
-            killed_pid = old_pid
+            pid = int(open(pid_path).read().strip())
+            if pid not in killed:
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True, timeout=5)
+                killed.append(pid)
+            os.remove(pid_path)
         except Exception:
             pass
+    return killed
 
-    import time
-    time.sleep(1)
 
-    # Start new process — use pythonw.exe (no console window, fully detached from any terminal)
+def _launch_bot(project_dir: str) -> subprocess.Popen:
+    """Start a fresh detached bot.py process."""
     log_path = os.path.join(project_dir, BOT_LOG)
     pythonw = sys.executable.replace("python.exe", "pythonw.exe")
     if not os.path.exists(pythonw):
-        pythonw = sys.executable  # fallback
+        pythonw = sys.executable
+    return subprocess.Popen(
+        [pythonw, os.path.join(project_dir, "bot.py")],
+        stdout=open(log_path, "w"),
+        stderr=subprocess.STDOUT,
+        cwd=project_dir,
+        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+
+
+def restart_bot() -> str:
+    import time
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    killed = _kill_all_bots(project_dir)
+    time.sleep(5)  # give Alpaca time to release the WebSocket connection server-side
     try:
-        proc = subprocess.Popen(
-            [pythonw, os.path.join(project_dir, "bot.py")],
-            stdout=open(log_path, "w"),
-            stderr=subprocess.STDOUT,
-            cwd=project_dir,
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-        )
-        msg = f"Bot restarted (PID {proc.pid})"
-        if killed_pid:
-            msg += f" — killed old PID {killed_pid}"
-        return msg
+        proc = _launch_bot(project_dir)
+        suffix = f" (killed {killed})" if killed else ""
+        return f"Bot restarted (PID {proc.pid}){suffix}"
     except Exception as e:
         return f"Failed to restart bot: {e}"
 
 
 def stop_bot() -> str:
-    """Kill bot process via PID file without restarting."""
     project_dir = os.path.dirname(os.path.abspath(__file__))
-    pid_path = os.path.join(project_dir, PID_FILE)
-    if not os.path.exists(pid_path):
-        return "Bot is not running (no PID file)."
-    try:
-        old_pid = int(open(pid_path).read().strip())
-        result = subprocess.run(["taskkill", "/F", "/PID", str(old_pid)],
-                                capture_output=True, timeout=5)
-        if result.returncode == 0:
-            try:
-                os.remove(pid_path)
-            except OSError:
-                pass
-            return f"Bot stopped (PID {old_pid})."
-        return f"taskkill failed (PID {old_pid}): {result.stderr.decode()}"
-    except Exception as e:
-        return f"Failed to stop bot: {e}"
+    killed = _kill_all_bots(project_dir)
+    if killed:
+        return f"Bot stopped — killed PIDs {killed}."
+    return "No bot processes found."
 
 
 def start_bot() -> str:
-    """Start bot without saving config (assumes live_config.json is current)."""
     project_dir = os.path.dirname(os.path.abspath(__file__))
+    # Check if already running
     pid_path = os.path.join(project_dir, PID_FILE)
     if os.path.exists(pid_path):
         try:
-            old_pid = int(open(pid_path).read().strip())
-            chk = subprocess.run(["tasklist", "/FI", f"PID eq {old_pid}"],
-                                 capture_output=True, timeout=5)
-            if str(old_pid) in chk.stdout.decode():
-                return f"Bot is already running (PID {old_pid})."
+            pid = int(open(pid_path).read().strip())
+            out = subprocess.check_output(
+                ["wmic", "process", "where", f"ProcessId={pid}", "get", "ProcessId"],
+                timeout=5,
+            ).decode("utf-16-le", errors="replace")
+            if str(pid) in out:
+                return f"Bot is already running (PID {pid})."
         except Exception:
             pass
-    log_path = os.path.join(project_dir, BOT_LOG)
-    pythonw = sys.executable.replace("python.exe", "pythonw.exe")
-    if not os.path.exists(pythonw):
-        pythonw = sys.executable
     try:
-        proc = subprocess.Popen(
-            [pythonw, os.path.join(project_dir, "bot.py")],
-            stdout=open(log_path, "w"),
-            stderr=subprocess.STDOUT,
-            cwd=project_dir,
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-        )
+        proc = _launch_bot(project_dir)
         return f"Bot started (PID {proc.pid})."
     except Exception as e:
         return f"Failed to start bot: {e}"

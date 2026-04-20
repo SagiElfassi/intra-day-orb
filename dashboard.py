@@ -256,8 +256,7 @@ def fetch_spy_benchmark(
         dates  = [str(b.timestamp.date()) for b in bars]
         closes = [float(b.close) for b in bars]
         entry  = closes[0]
-        risk_dollar = starting_equity * 0.01  # 1% of equity as proxy position
-        qty    = max(1, int(risk_dollar // entry))
+        qty    = max(1, int(starting_equity // entry))
         pnls   = [(c - entry) * qty for c in closes]
         return pd.DataFrame({"date": dates, "benchmark_pnl": pnls})
     except Exception:

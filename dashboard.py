@@ -1193,7 +1193,8 @@ tab_live, tab_bt, tab_scanner, tab_rules = st.tabs([
 
 # ── TAB 1 : LIVE ──────────────────────────────────────────────────────────────
 
-with tab_live:
+@st.fragment(run_every=60)
+def render_live_tab():
     trades_df = q_trades(selected_date_str)
     ranges_df = q_ranges(selected_date_str)
     events_df = q_events(selected_date_str)
@@ -1360,6 +1361,10 @@ with tab_live:
         else:
             st.dataframe(events_df[["timestamp", "event_type", "message"]],
                          use_container_width=True, hide_index=True)
+
+
+with tab_live:
+    render_live_tab()
 
 
 # ── TAB 2 : BACKTEST ──────────────────────────────────────────────────────────

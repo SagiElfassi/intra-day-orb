@@ -4,8 +4,6 @@ ORB Dynamic Momentum Trading Bot
 Production-ready automated trading system using Alpaca Markets API (alpaca-py).
 
 Strategy Overview:
-  - At 9:25 AM a PreMarketScanner ranks the configured universe by Gap % and RVOL,
-    selecting the top N symbols with the most institutional momentum for the day.
   - A 1-minute Opening Range is built from 9:30–9:45 AM (configurable).
   - Breakout is only confirmed when three additional filters pass simultaneously:
       1. VWAP filter   — close must be above (LONG) or below (SHORT) intraday VWAP.
@@ -14,18 +12,15 @@ Strategy Overview:
   - Position sizing is volatility-adjusted: risk_pct_equity % of account equity is
     divided by the per-share distance to stop-loss, so every trade risks the same
     dollar amount regardless of price or volatility.
-  - Execution uses a two-leg scale-out bracket:
-      Leg 1 (50% of shares): TP1 at 1.0R — locks in a guaranteed partial win.
-      Leg 2 (50% of shares): TP2 at 3.0R — let winners run.
-    When Leg 1 fills the bot cancels the original SL on Leg 2 and replaces it with
-    a break-even stop, eliminating further downside on the second half.
+  - Execution uses a single bracket order:
+      Full position exits at TP = entry ± ORB_range × risk_ratio.
+      Alpaca's OCO mechanism auto-cancels the SL when TP fills.
 
 Architecture:
   - StockDataStream (WebSocket) for real-time 1-min bar data.
   - Asyncio-native event loop with executor-wrapped blocking REST calls.
   - Per-symbol state machine:
-      WAITING_RANGE → SCANNING → SUBMITTING → IN_TRADE
-      → PARTIAL_EXIT → BREAK_EVEN → COMPLETED
+      WAITING_RANGE → SCANNING → SUBMITTING → IN_TRADE → COMPLETED
   - SQLite for trade/event logging (read by dashboard.py).
   - Kill switch + auto-flatten (3:55 PM) safety protocols.
   - WebSocket reconnection with exponential back-off + REST resync.
@@ -43,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import aiosqlite
@@ -55,14 +50,13 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
 from alpaca.data.models import Bar
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
 from alpaca.trading.requests import (
     MarketOrderRequest,
     StopLimitOrderRequest,
     StopLossRequest,
-    StopOrderRequest,
     TakeProfitRequest,
 )
 
@@ -118,8 +112,7 @@ class Config:
                 saved = json.load(f)
             scalar_fields = [
                 ("min_orb_volume", int),    ("min_atr_pct", float),     ("max_spread_pct", float),
-                ("gap_min_pct", float),     ("rvol_min", float),        ("risk_pct_equity", float),
-                ("max_position_usd", float),("tp1_r", float),           ("tp2_r", float),
+                ("risk_pct_equity", float), ("max_position_usd", float),("risk_ratio", float),
                 ("volume_surge_mult", float),("vwap_filter", bool),
             ]
             for attr, cast in scalar_fields:
@@ -131,6 +124,10 @@ class Config:
                 self.orb_minutes = int(saved["orb_minutes"])
             if "stop_loss_type" in saved:
                 self.stop_loss_type = str(saved["stop_loss_type"])
+            if "trading_window_end_hour" in saved:
+                self.trading_window_end_hour = int(saved["trading_window_end_hour"])
+            if "trading_window_end_minute" in saved:
+                self.trading_window_end_minute = int(saved["trading_window_end_minute"])
         except Exception:
             pass
 
@@ -148,11 +145,6 @@ class Config:
     stop_loss_type: str = field(default_factory=lambda: os.environ.get("STOP_LOSS_TYPE", "midpoint"))
     min_bars_required: int = field(default_factory=lambda: int(os.environ.get("MIN_BARS_REQUIRED", "13")))
 
-    # Pre-market scanner
-    gap_min_pct: float  = field(default_factory=lambda: float(os.environ.get("GAP_MIN_PCT",  "1.5")))
-    rvol_min: float     = field(default_factory=lambda: float(os.environ.get("RVOL_MIN",     "2.0")))
-    scanner_top_n: int  = field(default_factory=lambda: int(os.environ.get("SCANNER_TOP_N", "5")))
-
     # Multi-factor confirmation filters
     vwap_filter: bool         = field(default_factory=lambda: os.environ.get("VWAP_FILTER", "true").lower() == "true")
     volume_surge_mult: float  = field(default_factory=lambda: float(os.environ.get("VOLUME_SURGE_MULT", "1.5")))
@@ -163,15 +155,13 @@ class Config:
     # Institutional risk management
     risk_pct_equity: float  = field(default_factory=lambda: float(os.environ.get("RISK_PCT_EQUITY", "1.0")))
     max_position_usd: float = field(default_factory=lambda: float(os.environ.get("MAX_POSITION_USD", "0")))
-    tp1_r: float            = field(default_factory=lambda: float(os.environ.get("TP1_R", "1.0")))
-    tp2_r: float            = field(default_factory=lambda: float(os.environ.get("TP2_R", "3.0")))
 
     # Legacy fixed size (kept for backtest compatibility; bot uses risk_pct_equity)
     position_size_usd: float = field(default_factory=lambda: float(os.environ.get("POSITION_SIZE_USD", "1000.0")))
 
     # Time-of-day filter — no new entries after this time
-    trading_window_end_hour:   int   = 10
-    trading_window_end_minute: int   = 30
+    trading_window_end_hour:   int   = 11
+    trading_window_end_minute: int   = 0
 
     # ATR stop-loss multiplier (used when stop_loss_type="atr")
     atr_sl_mult: float = 1.5
@@ -202,14 +192,12 @@ class Config:
 
 # ── Per-Symbol State ───────────────────────────────────────────────────────────
 
-STATUS_WAITING       = "WAITING_RANGE"
-STATUS_SCANNING      = "SCANNING"
-STATUS_SUBMITTING    = "SUBMITTING"      # order REST call in flight — blocks re-entry
-STATUS_IN_TRADE      = "IN_TRADE"        # both bracket legs live
-STATUS_PARTIAL_EXIT  = "PARTIAL_EXIT"    # TP1 hit, SL-to-BE move in progress
-STATUS_BREAK_EVEN    = "BREAK_EVEN"      # TP1 hit, SL now at entry, TP2 leg still open
-STATUS_COMPLETED     = "COMPLETED"
-STATUS_INVALID       = "INVALID"
+STATUS_WAITING    = "WAITING_RANGE"
+STATUS_SCANNING   = "SCANNING"
+STATUS_SUBMITTING = "SUBMITTING"   # order REST call in flight — blocks re-entry
+STATUS_IN_TRADE   = "IN_TRADE"     # bracket order live
+STATUS_COMPLETED  = "COMPLETED"
+STATUS_INVALID    = "INVALID"
 
 
 @dataclass
@@ -222,23 +210,18 @@ class TickerState:
     range_mid:  Optional[float] = None
     avg_orb_volume: float = 0.0                     # average volume per ORB bar
 
-    # Multi-leg order IDs
-    order_id:     Optional[str] = None              # alias for order1_id (backward-compat)
-    order1_id:    Optional[str] = None              # TP1 bracket (half qty)
-    order2_id:    Optional[str] = None              # TP2 bracket (remaining qty)
-    sl2_order_id: Optional[str] = None              # break-even stop (placed after TP1 hits)
+    order_id:  Optional[str] = None
+    order1_id: Optional[str] = None              # kept for DB/resume compat
 
     trade_db_id: Optional[int] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     trade_date: Optional[str] = None
 
     # Position details
-    side: Optional[str] = None                      # "LONG" | "SHORT"
+    side: Optional[str] = None                   # "LONG" | "SHORT"
     entry_price: Optional[float] = None
     sl_price:    Optional[float] = None
-    tp1_price:   Optional[float] = None
-    tp2_price:   Optional[float] = None
-    half_qty: int = 0
+    tp_price:    Optional[float] = None
     entry_qty_requested: int = 0
     entry_qty_filled:    int = 0
 
@@ -246,15 +229,8 @@ class TickerState:
     vwap_num: float = 0.0   # Σ(typical_price × volume)
     vwap_den: float = 0.0   # Σ(volume)
 
-    # Partial-exit tracking
-    realized_pnl_tp1: float = 0.0
-
     # ATR (% of price) cached at range-finalization for use in SL calculation
     atr_pct: float = 0.0
-
-    # Pre-market scanner results (recorded for audit trail)
-    gap_pct: float = 0.0
-    rvol:    float = 0.0
 
 
 # ── Database Manager ───────────────────────────────────────────────────────────
@@ -428,121 +404,11 @@ class DatabaseManager:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM trades WHERE date=? AND status IN "
-                "('PENDING','OPEN','PARTIAL_EXIT','BREAK_EVEN')",
+                "('PENDING','OPEN')",
                 (today,),
             )
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
-
-
-# ── Pre-Market Scanner ─────────────────────────────────────────────────────────
-
-class PreMarketScanner:
-    """
-    Runs at 9:25 AM EST to select the day's trading symbols.
-
-    Scoring criteria (both must pass the configured minimums):
-      Gap %  = (today's first premarket open − yesterday's close) / yesterday's close × 100
-               Measures overnight momentum or news-driven gap.
-      RVOL   = (today's premarket volume / 325 premarket minutes)
-               ÷ (20-day avg daily volume / 390 regular-session minutes)
-               > 1.0 means above-average premarket pace; 2.0 means 2× normal pace.
-
-    Symbols are ranked by RVOL (highest first) among those that pass both thresholds.
-    The top-N are returned as the active trading universe for the day.
-
-    Note: uses the historical REST API, not the live stream.
-          IEX feed covers premarket volume for US-listed stocks.
-          SIP feed provides consolidated tape for more accurate volume.
-    """
-
-    _PREMARKET_MINUTES: int = 325   # 4:00 AM → 9:25 AM
-    _SESSION_MINUTES:   int = 390   # 9:30 AM → 4:00 PM
-
-    def __init__(self, client: StockHistoricalDataClient, feed: DataFeed):
-        self.client = client
-        self.feed   = feed
-
-    async def scan(
-        self,
-        universe: List[str],
-        gap_min_pct: float,
-        rvol_min: float,
-        top_n: int = 5,
-    ) -> List[Tuple[str, float, float]]:
-        """
-        Returns List[(symbol, gap_pct, rvol)] for the top qualifying symbols.
-        Returns an empty list if no symbol meets both thresholds.
-        """
-        loop    = asyncio.get_running_loop()
-        today   = datetime.now(ZoneInfo("America/New_York")).date()
-        results: List[Tuple[str, float, float]] = []
-
-        for symbol in universe:
-            try:
-                gap_pct, rvol = await loop.run_in_executor(
-                    None, lambda s=symbol: self._score_symbol(s, today)
-                )
-                logger.info(
-                    "Scanner  %s  gap=%.2f%%  rvol=%.2fx", symbol, gap_pct, rvol
-                )
-                if abs(gap_pct) >= gap_min_pct and rvol >= rvol_min:
-                    results.append((symbol, gap_pct, rvol))
-            except Exception as exc:
-                logger.debug("Scanner skip %s: %s", symbol, exc)
-
-        results.sort(key=lambda x: x[2], reverse=True)
-        return results[:top_n]
-
-    def _score_symbol(self, symbol: str, today) -> Tuple[float, float]:
-        """Blocking helper — runs in executor."""
-        # ── Daily bars for previous close + 20-day average volume ──
-        daily_req = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Day,
-            start=datetime(today.year, today.month, today.day, tzinfo=ZoneInfo("America/New_York"))
-                  - timedelta(days=30),
-            end=datetime(today.year, today.month, today.day, tzinfo=ZoneInfo("America/New_York")),
-            feed=self.feed,
-        )
-        daily_resp = self.client.get_stock_bars(daily_req)
-        daily_bars = daily_resp[symbol] if symbol in daily_resp else []
-        if len(daily_bars) < 2:
-            return 0.0, 0.0
-
-        prev_close   = float(daily_bars[-1].close)
-        avg_daily_vol = (
-            sum(float(b.volume) for b in daily_bars[-20:]) / min(20, len(daily_bars))
-        )
-        if avg_daily_vol <= 0:
-            return 0.0, 0.0
-
-        # ── Today's premarket bars (4:00 AM → 9:25 AM) ──
-        tz = ZoneInfo("America/New_York")
-        pm_start = datetime(today.year, today.month, today.day, 4,  0, tzinfo=tz)
-        pm_end   = datetime(today.year, today.month, today.day, 9, 25, tzinfo=tz)
-
-        pm_req = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame(1, TimeFrameUnit.Minute),
-            start=pm_start,
-            end=pm_end,
-            feed=self.feed,
-        )
-        pm_resp = self.client.get_stock_bars(pm_req)
-        pm_bars = pm_resp[symbol] if symbol in pm_resp else []
-        if not pm_bars:
-            return 0.0, 0.0
-
-        # Gap % vs previous close
-        first_open = float(pm_bars[0].open)
-        gap_pct    = (first_open - prev_close) / prev_close * 100.0
-
-        # RVOL: annualise premarket volume to a full session equivalent
-        pm_volume = sum(float(b.volume) for b in pm_bars)
-        rvol = (pm_volume / self._PREMARKET_MINUTES) / (avg_daily_vol / self._SESSION_MINUTES)
-
-        return round(gap_pct, 2), round(rvol, 2)
 
 
 # ── Core Bot ───────────────────────────────────────────────────────────────────
@@ -561,13 +427,11 @@ class ORBBot:
         self.historical_client = StockHistoricalDataClient(
             api_key=config.api_key, secret_key=config.api_secret,
         )
-        self.scanner = PreMarketScanner(self.historical_client, config.data_feed)
 
         self.states: Dict[str, TickerState] = {
             sym: TickerState(symbol=sym) for sym in config.symbols
         }
 
-        # Symbols selected by the pre-market scanner for today (starts as full universe)
         self.active_symbols: set = set(config.symbols)
 
         self.starting_equity: float = 0.0
@@ -613,29 +477,20 @@ class ORBBot:
                 if alpaca_status in ("filled", "partially_filled", "accepted",
                                      "pending_new", "new"):
                     filled_qty = int(float(order.filled_qty or trade["qty"]))
-                    target_status = (
-                        STATUS_BREAK_EVEN if db_status == "BREAK_EVEN"
-                        else STATUS_PARTIAL_EXIT if db_status == "PARTIAL_EXIT"
-                        else STATUS_IN_TRADE
-                    )
                     async with state.lock:
-                        state.status              = target_status
+                        state.status              = STATUS_IN_TRADE
                         state.order_id            = order_id
                         state.order1_id           = order_id
-                        state.order2_id           = trade.get("order2_id")
                         state.trade_db_id         = trade_id
                         state.trade_date          = today
                         state.entry_qty_requested = int(float(trade["qty"]))
                         state.entry_qty_filled    = filled_qty
-                        state.tp1_price           = trade.get("tp1_price")
-                        state.tp2_price           = trade.get("tp2_price")
+                        state.tp_price            = trade.get("tp1_price") or trade.get("take_profit")
                         state.sl_price            = trade.get("stop_loss")
                         state.entry_price         = trade.get("entry_price")
-                        state.half_qty            = int(float(trade["qty"])) // 2
                         state.side                = trade.get("side")
-                        state.realized_pnl_tp1    = float(trade.get("partial_pnl") or 0)
-                    logger.info("%s | RESUMED → %s (order=%s)", symbol, target_status, order_id)
-                    await self.db.log_event("RESUMED", f"{symbol}: {target_status} order={order_id}")
+                    logger.info("%s | RESUMED → IN_TRADE (order=%s)", symbol, order_id)
+                    await self.db.log_event("RESUMED", f"{symbol}: IN_TRADE order={order_id}")
                     self.active_symbols.add(symbol)
 
                 elif alpaca_status in ("canceled", "expired", "done_for_day",
@@ -692,22 +547,19 @@ class ORBBot:
                 state.bars                = []
                 state.range_high = state.range_low = state.range_mid = None
                 state.avg_orb_volume      = 0.0
-                state.order_id = state.order1_id = state.order2_id = state.sl2_order_id = None
+                state.order_id = state.order1_id = None
                 state.trade_db_id         = None
-                state.entry_price = state.sl_price = state.tp1_price = state.tp2_price = None
+                state.entry_price = state.sl_price = state.tp_price = None
                 state.side                = None
-                state.half_qty            = 0
                 state.entry_qty_requested = 0
                 state.entry_qty_filled    = 0
                 state.vwap_num            = 0.0
                 state.vwap_den            = 0.0
-                state.realized_pnl_tp1   = 0.0
                 state.trade_date          = today
 
             # Block new signals for these terminal/transitional states
             if state.status in (
                 STATUS_IN_TRADE, STATUS_SUBMITTING,
-                STATUS_PARTIAL_EXIT, STATUS_BREAK_EVEN,
                 STATUS_COMPLETED, STATUS_INVALID,
             ):
                 return
@@ -922,24 +774,10 @@ class ORBBot:
     async def _submit_bracket_order(
         self, state: TickerState, bar: Bar, signal: str, today: str,
     ):
-        """
-        Two-leg scale-out bracket order.
-
-        Sizing:
-          risk_dollar = risk_pct_equity % of starting_equity
-          total_qty   = floor(risk_dollar / risk_per_share)  ← volatility-adjusted
-          half_qty    = total_qty // 2
-
-        Leg 1  (half_qty,      TP1 = entry + 1.0R,  SL = range_mid/low)
-        Leg 2  (remaining_qty, TP2 = entry + 3.0R,  SL = same level)
-
-        When Leg 1's TP fills the bot moves Leg 2's SL to break-even (entry price).
-        """
         close     = bar.close
         orb_range = state.range_high - state.range_low
         side      = OrderSide.BUY if signal == "LONG" else OrderSide.SELL
 
-        # Stop-Limit entry prices
         offset = self.config.entry_limit_offset_pct
         if signal == "LONG":
             entry_stop  = round(state.range_high, 2)
@@ -948,159 +786,81 @@ class ORBBot:
             entry_stop  = round(state.range_low, 2)
             entry_limit = round(state.range_low  * (1 - offset), 2)
 
-        # Stop-loss: midpoint | hard | atr
         if self.config.stop_loss_type == "atr" and state.atr_pct > 0:
             atr_dollar = (state.atr_pct / 100.0) * entry_stop
             sl_dist    = round(atr_dollar * self.config.atr_sl_mult, 2)
             sl = round(entry_stop - sl_dist, 2) if signal == "LONG" else round(entry_stop + sl_dist, 2)
         elif self.config.stop_loss_type == "midpoint":
-            sl = round(state.range_mid if signal == "LONG" else state.range_mid, 2)
-        else:  # hard
+            sl = round(state.range_mid, 2)
+        else:
             sl = round(state.range_low if signal == "LONG" else state.range_high, 2)
 
         if signal == "LONG":
-            tp1 = round(entry_stop + orb_range * self.config.tp1_r, 2)
-            tp2 = round(entry_stop + orb_range * self.config.tp2_r, 2)
+            tp = round(entry_stop + orb_range * self.config.risk_ratio, 2)
         else:
-            tp1 = round(entry_stop - orb_range * self.config.tp1_r, 2)
-            tp2 = round(entry_stop - orb_range * self.config.tp2_r, 2)
+            tp = round(entry_stop - orb_range * self.config.risk_ratio, 2)
 
         risk_per_share = abs(entry_stop - sl)
         if risk_per_share <= 0:
             state.status = STATUS_COMPLETED
             return
 
-        risk_dollar    = self.starting_equity * self.config.risk_pct_equity / 100.0
-        total_qty      = max(2, math.floor(risk_dollar / risk_per_share))
+        risk_dollar = self.starting_equity * self.config.risk_pct_equity / 100.0
+        total_qty   = max(1, math.floor(risk_dollar / risk_per_share))
         if self.config.max_position_usd > 0:
-            total_qty  = min(total_qty, max(2, math.floor(self.config.max_position_usd / close)))
-        half_qty       = total_qty // 2
-        remaining_qty  = total_qty - half_qty
+            total_qty = min(total_qty, max(1, math.floor(self.config.max_position_usd / close)))
 
         entry_vwap = round(state.vwap_num / state.vwap_den, 4) if state.vwap_den > 0 else 0.0
 
-        req1 = StopLimitOrderRequest(
-            symbol=state.symbol, qty=half_qty, side=side,
+        req = StopLimitOrderRequest(
+            symbol=state.symbol, qty=total_qty, side=side,
             time_in_force=TimeInForce.DAY,
             stop_price=entry_stop, limit_price=entry_limit,
             order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=tp1),
-            stop_loss=StopLossRequest(stop_price=sl),
-        )
-        req2 = StopLimitOrderRequest(
-            symbol=state.symbol, qty=remaining_qty, side=side,
-            time_in_force=TimeInForce.DAY,
-            stop_price=entry_stop, limit_price=entry_limit,
-            order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=tp2),
+            take_profit=TakeProfitRequest(limit_price=tp),
             stop_loss=StopLossRequest(stop_price=sl),
         )
 
         try:
-            loop   = asyncio.get_running_loop()
-            order1 = await loop.run_in_executor(None, self.trading_client.submit_order, req1)
-            order2 = await loop.run_in_executor(None, self.trading_client.submit_order, req2)
+            loop  = asyncio.get_running_loop()
+            order = await loop.run_in_executor(None, self.trading_client.submit_order, req)
 
-            state.order_id            = str(order1.id)
-            state.order1_id           = str(order1.id)
-            state.order2_id           = str(order2.id)
-            state.sl2_order_id        = None
-            state.half_qty            = half_qty
+            state.order_id            = str(order.id)
+            state.order1_id           = str(order.id)
             state.entry_qty_requested = total_qty
             state.entry_qty_filled    = 0
             state.sl_price            = sl
-            state.tp1_price           = tp1
-            state.tp2_price           = tp2
+            state.tp_price            = tp
             state.side                = signal
             state.status              = STATUS_IN_TRADE
 
             trade_id = await self.db.insert_trade(
                 date=today, symbol=state.symbol, side=signal,
-                qty=total_qty, take_profit=tp1, stop_loss=sl,
-                order_id=state.order1_id,
-                order2_id=state.order2_id,
-                tp1_price=tp1, tp2_price=tp2,
-                gap_pct=state.gap_pct, rvol=state.rvol,
+                qty=total_qty, take_profit=tp, stop_loss=sl,
+                order_id=state.order_id,
+                tp1_price=tp,
+                gap_pct=0.0, rvol=0.0,
                 entry_vwap=entry_vwap,
             )
             state.trade_db_id = trade_id
 
             logger.info(
-                "%s | ORDERS SUBMITTED  stop=%.2f limit=%.2f  "
-                "leg1=%s (x%d->TP1=%.2f)  leg2=%s (x%d->TP2=%.2f)  "
-                "SL=%.2f  risk=$%.0f (%.1f%% equity)",
+                "%s | ORDER SUBMITTED  stop=%.2f limit=%.2f  "
+                "order=%s (x%d->TP=%.2f)  SL=%.2f  risk=$%.0f (%.1f%% equity)",
                 state.symbol, entry_stop, entry_limit,
-                order1.id, half_qty,      tp1,
-                order2.id, remaining_qty, tp2,
-                sl,
+                order.id, total_qty, tp, sl,
                 risk_dollar, self.config.risk_pct_equity,
             )
             await self.db.log_event(
                 "ORDER_SUBMITTED",
-                f"{state.symbol} {signal} total_qty={total_qty} "
-                f"TP1={tp1} TP2={tp2} SL={sl} "
-                f"leg1={order1.id} leg2={order2.id}",
+                f"{state.symbol} {signal} qty={total_qty} TP={tp} SL={sl} order={order.id}",
             )
-            await self._email_entry(
-                state.symbol, signal, total_qty, entry_stop, sl,
-                tp1 if self.config.tp1_r > 0 else None, tp2, risk_dollar,
-            )
+            await self._email_entry(state.symbol, signal, total_qty, entry_stop, sl, tp, risk_dollar)
 
         except Exception as exc:
             state.status = STATUS_COMPLETED
             logger.error("%s | Order submission FAILED: %s", state.symbol, exc)
             await self.db.log_event("ORDER_ERROR", f"{state.symbol}: {exc}")
-
-    async def _move_sl_to_breakeven(self, state: TickerState):
-        """
-        Called after TP1 fills.
-        1. Locates the original SL child leg of order2.
-        2. Cancels it.
-        3. Places a new stop order at the entry price (break-even).
-        """
-        if not state.order2_id or not state.entry_price:
-            return
-        loop = asyncio.get_running_loop()
-        try:
-            order2 = await loop.run_in_executor(
-                None, lambda: self.trading_client.get_order_by_id(state.order2_id)
-            )
-            # Find and cancel the original SL leg
-            for leg in (order2.legs or []):
-                leg_type = str(getattr(leg, "order_type", "")).lower()
-                if leg_type in ("stop", "stop_limit"):
-                    await loop.run_in_executor(
-                        None,
-                        lambda oid=str(leg.id): self.trading_client.cancel_order_by_id(oid),
-                    )
-                    break
-
-            # Submit break-even stop for the remaining shares
-            remaining = state.entry_qty_requested - state.half_qty
-            be_side   = OrderSide.SELL if state.side == "LONG" else OrderSide.BUY
-            be_req    = StopOrderRequest(
-                symbol=state.symbol, qty=remaining, side=be_side,
-                time_in_force=TimeInForce.DAY,
-                stop_price=round(state.entry_price, 2),
-            )
-            be_order = await loop.run_in_executor(None, self.trading_client.submit_order, be_req)
-
-            async with state.lock:
-                state.sl2_order_id = str(be_order.id)
-                state.sl_price     = state.entry_price  # track updated SL level
-
-            logger.info(
-                "%s | SL moved to break-even %.2f  (be_order=%s)",
-                state.symbol, state.entry_price, be_order.id,
-            )
-            await self.db.log_event(
-                "BREAK_EVEN_SET",
-                f"{state.symbol}: SL → entry {state.entry_price:.2f} (order {be_order.id})",
-            )
-
-        except Exception as exc:
-            logger.error("%s | Failed to move SL to break-even: %s", state.symbol, exc)
-            await self.db.log_event("BREAK_EVEN_ERROR", f"{state.symbol}: {exc}")
 
     # ── Risk Management ────────────────────────────────────────────────────────
 
@@ -1170,11 +930,10 @@ class ORBBot:
             logger.warning("Email failed: %s", exc)
 
     async def _email_entry(self, symbol: str, signal: str, qty: int, entry: float,
-                           sl: float, tp1: float | None, tp2: float, risk_dollar: float):
+                           sl: float, tp: float, risk_dollar: float):
         mode  = "PAPER" if self.config.paper else "LIVE"
         color = "#26a69a" if signal == "LONG" else "#ef5350"
         arrow = "&#9650;" if signal == "LONG" else "&#9660;"
-        tp1_row = f"<tr><td>TP1</td><td>${tp1:.2f}</td></tr>" if tp1 else ""
         html = f"""
         <div style="font-family:monospace;max-width:480px">
           <h2 style="color:{color}">{arrow} {signal} Entry — {symbol} [{mode}]</h2>
@@ -1184,25 +943,20 @@ class ORBBot:
             <tr><td><b>Qty</b></td><td>{qty} shares</td></tr>
             <tr><td><b>Entry</b></td><td>${entry:.2f}</td></tr>
             <tr><td><b>Stop Loss</b></td><td>${sl:.2f}</td></tr>
-            {tp1_row}
-            <tr><td><b>TP2</b></td><td>${tp2:.2f}</td></tr>
+            <tr><td><b>Take Profit</b></td><td>${tp:.2f}</td></tr>
             <tr><td><b>Risk $</b></td><td>${risk_dollar:.2f}</td></tr>
             <tr><td><b>Time</b></td><td>{datetime.now(self.config.tz).strftime('%H:%M:%S EST')}</td></tr>
           </table>
         </div>"""
         await self._send_email(f"[ORB {mode}] {arrow} {signal} {symbol} @ ${entry:.2f}", html)
 
-    async def _email_exit(self, symbol: str, event: str, fill: float,
-                          pnl: float, total_pnl: float | None = None):
+    async def _email_exit(self, symbol: str, event: str, fill: float, pnl: float):
         mode   = "PAPER" if self.config.paper else "LIVE"
         labels = {
-            "TP1_HIT":   ("TP1 Hit",        "#26a69a"),
-            "TP2_HIT":   ("TP2 Hit - Full", "#00e676"),
-            "CLOSED_SL": ("Stop Loss Hit",  "#ef5350"),
-            "CLOSED_BE": ("Break-Even Stop","#ff9800"),
+            "CLOSED_TP": ("Take Profit Hit", "#26a69a"),
+            "CLOSED_SL": ("Stop Loss Hit",   "#ef5350"),
         }
         label, color = labels.get(event, (event, "#90a4ae"))
-        total_row = f"<tr><td><b>Total PnL</b></td><td style='color:{'#26a69a' if (total_pnl or 0)>=0 else '#ef5350'}'><b>${total_pnl:+.2f}</b></td></tr>" if total_pnl is not None else ""
         pnl_color = "#26a69a" if pnl >= 0 else "#ef5350"
         html = f"""
         <div style="font-family:monospace;max-width:480px">
@@ -1210,12 +964,10 @@ class ORBBot:
           <table style="border-collapse:collapse;width:100%">
             <tr><td><b>Symbol</b></td><td>{symbol}</td></tr>
             <tr><td><b>Exit Price</b></td><td>${fill:.2f}</td></tr>
-            <tr><td><b>Leg PnL</b></td><td style="color:{pnl_color}">${pnl:+.2f}</td></tr>
-            {total_row}
+            <tr><td><b>PnL</b></td><td style="color:{pnl_color}">${pnl:+.2f}</td></tr>
             <tr><td><b>Time</b></td><td>{datetime.now(self.config.tz).strftime('%H:%M:%S EST')}</td></tr>
           </table>
         </div>"""
-        emoji = "+" if pnl >= 0 else "-"
         await self._send_email(f"[ORB {mode}] {label} {symbol} ${pnl:+.2f}", html)
 
     async def _email_eod_summary(self, today: str):
@@ -1260,236 +1012,110 @@ class ORBBot:
         </div>"""
         await self._send_email(f"[ORB {mode}] EOD Summary {today} | PnL ${total_pnl:+.2f}", html)
 
-        _live = (STATUS_IN_TRADE, STATUS_PARTIAL_EXIT, STATUS_BREAK_EVEN)
         for state in self.states.values():
             async with state.lock:
-                if state.status in _live:
+                if state.status == STATUS_IN_TRADE:
                     state.status = STATUS_COMPLETED
                     if state.trade_db_id:
                         await self.db.update_trade(
                             state.trade_db_id, status="CLOSED_MANUAL",
                             closed_at=datetime.now(timezone.utc).isoformat(),
                         )
-        await self.db.log_event(reason, "All positions flattened")
+        await self.db.log_event("EOD_FLATTEN", "All positions flattened")
 
     # ── Background Tasks ───────────────────────────────────────────────────────
 
     async def _order_fill_monitor(self):
-        """
-        Polls every 20 s to sync bracket leg fills back to the DB.
-
-        STATE: IN_TRADE
-          • Tracks entry partial fills.
-          • If order1's TP1 limit leg fills → PARTIAL_EXIT, calls _move_sl_to_breakeven.
-          • If any SL leg fills            → COMPLETED (full stop-out).
-
-        STATE: PARTIAL_EXIT / BREAK_EVEN
-          • If sl2_order_id fills (break-even stop) → COMPLETED (scratch second half).
-          • If order2's TP2 limit leg fills          → COMPLETED (full winner).
-        """
-        _live = (STATUS_IN_TRADE, STATUS_PARTIAL_EXIT, STATUS_BREAK_EVEN)
-
+        """Polls every 20 s to sync bracket fills back to the DB."""
         while not self.kill_switch_triggered:
             await asyncio.sleep(20)
             loop = asyncio.get_running_loop()
 
             for state in self.states.values():
                 async with state.lock:
-                    if state.status not in _live:
+                    if state.status != STATUS_IN_TRADE:
                         continue
-                    order1_id    = state.order1_id
-                    order2_id    = state.order2_id
-                    sl2_id       = state.sl2_order_id
-                    status       = state.status
-                    trade_db_id  = state.trade_db_id
-                    prev_filled  = state.entry_qty_filled
-                    qty_req      = state.entry_qty_requested
+                    order_id    = state.order_id
+                    trade_db_id = state.trade_db_id
+                    prev_filled = state.entry_qty_filled
+                    qty_req     = state.entry_qty_requested
 
                 try:
-                    # ── STATUS_IN_TRADE ──────────────────────────────────────
-                    if status == STATUS_IN_TRADE and order1_id:
-                        o1 = await loop.run_in_executor(
-                            None, lambda oid=order1_id: self.trading_client.get_order_by_id(oid)
+                    if not order_id:
+                        continue
+                    o = await loop.run_in_executor(
+                        None, lambda oid=order_id: self.trading_client.get_order_by_id(oid)
+                    )
+
+                    # Track entry fill
+                    filled = int(float(o.filled_qty or 0))
+                    if filled > 0 and filled != prev_filled:
+                        upd: dict = {"status": "OPEN", "qty": filled}
+                        if o.filled_avg_price:
+                            fill_px = round(float(o.filled_avg_price), 4)
+                            upd["entry_price"] = fill_px
+                            async with state.lock:
+                                state.entry_price      = fill_px
+                                state.entry_qty_filled = filled
+                        if trade_db_id:
+                            await self.db.update_trade(trade_db_id, **upd)
+                        if 0 < filled < qty_req:
+                            logger.warning("%s | PARTIAL FILL: %d/%d shares",
+                                           state.symbol, filled, qty_req)
+
+                    # Check bracket leg fills
+                    for leg in (o.legs or []):
+                        if str(getattr(leg, "status", "")).lower() != "filled":
+                            continue
+                        leg_type   = str(getattr(leg, "order_type", "")).lower()
+                        fill_price = round(float(leg.filled_avg_price), 4)
+                        entry      = state.entry_price or fill_price
+                        pnl        = round(
+                            (fill_price - entry) * qty_req if state.side == "LONG"
+                            else (entry - fill_price) * qty_req,
+                            2,
                         )
 
-                        # Track entry partial fill
-                        filled = int(float(o1.filled_qty or 0))
-                        if filled > 0 and filled != prev_filled:
-                            upd: dict = {"status": "OPEN", "qty": filled}
-                            if o1.filled_avg_price:
-                                fill_px = round(float(o1.filled_avg_price), 4)
-                                upd["entry_price"] = fill_px
-                                async with state.lock:
-                                    state.entry_price      = fill_px
-                                    state.entry_qty_filled = filled
-                            if trade_db_id:
-                                await self.db.update_trade(trade_db_id, **upd)
-                            if 0 < filled < qty_req:
-                                logger.warning(
-                                    "%s | PARTIAL FILL: %d/%d shares (leg1)",
-                                    state.symbol, filled, state.half_qty,
-                                )
+                        if "limit" in leg_type:
+                            db_status = "CLOSED_TP"
+                            log_event = "CLOSED_TP"
+                            log_msg   = f"{state.symbol} TP fill={fill_price:.4f} pnl={pnl:.2f}"
+                            logger.info("%s | TP HIT @ %.4f  pnl=$%.2f", state.symbol, fill_price, pnl)
+                        else:
+                            db_status = "CLOSED_SL"
+                            log_event = "CLOSED_SL"
+                            log_msg   = f"{state.symbol} SL fill={fill_price:.4f}"
+                            logger.info("%s | SL HIT @ %.4f  pnl=$%.2f", state.symbol, fill_price, pnl)
 
-                        # Check TP1 / SL leg fills on order1
-                        for leg in (o1.legs or []):
-                            leg_status = str(getattr(leg, "status", "")).lower()
-                            if leg_status != "filled":
-                                continue
-                            leg_type   = str(getattr(leg, "order_type", "")).lower()
-                            fill_price = round(float(leg.filled_avg_price), 4)
-
-                            if "limit" in leg_type:
-                                # TP1 hit — partial exit
-                                half   = state.half_qty
-                                entry  = state.entry_price or fill_price
-                                pnl1   = round(
-                                    (fill_price - entry) * half if state.side == "LONG"
-                                    else (entry - fill_price) * half,
-                                    2,
-                                )
-                                async with state.lock:
-                                    state.realized_pnl_tp1 = pnl1
-                                    state.status = STATUS_PARTIAL_EXIT
-
-                                if trade_db_id:
-                                    await self.db.update_trade(
-                                        trade_db_id, partial_pnl=pnl1, status="PARTIAL_EXIT"
-                                    )
-                                logger.info(
-                                    "%s | TP1 HIT @ %.4f  partial_pnl=$%.2f",
-                                    state.symbol, fill_price, pnl1,
-                                )
-                                await self.db.log_event(
-                                    "TP1_HIT", f"{state.symbol} fill={fill_price:.4f} pnl={pnl1:.2f}"
-                                )
-                                await self._email_exit(state.symbol, "TP1_HIT", fill_price, pnl1)
-                                await self._move_sl_to_breakeven(state)
-                                async with state.lock:
-                                    state.status = STATUS_BREAK_EVEN
-                                if trade_db_id:
-                                    await self.db.update_trade(trade_db_id, status="BREAK_EVEN")
-
-                            else:
-                                # SL hit on leg1 — full stop-out
-                                remaining = state.entry_qty_requested - state.half_qty
-                                entry     = state.entry_price or fill_price
-                                total_pnl = round(
-                                    (fill_price - entry) * state.entry_qty_requested
-                                    if state.side == "LONG"
-                                    else (entry - fill_price) * state.entry_qty_requested,
-                                    2,
-                                )
-                                async with state.lock:
-                                    state.status = STATUS_COMPLETED
-                                if trade_db_id:
-                                    await self.db.update_trade(
-                                        trade_db_id,
-                                        exit_price=fill_price,
-                                        realized_pnl=total_pnl,
-                                        status="CLOSED_SL",
-                                        closed_at=datetime.now(timezone.utc).isoformat(),
-                                    )
-                                logger.info(
-                                    "%s | SL HIT @ %.4f  total_pnl=$%.2f",
-                                    state.symbol, fill_price, total_pnl,
-                                )
-                                await self.db.log_event(
-                                    "CLOSED_SL", f"{state.symbol} exit={fill_price:.4f}"
-                                )
-                                await self._email_exit(state.symbol, "CLOSED_SL", fill_price, total_pnl, total_pnl)
-                            break
-
-                    # ── STATUS_PARTIAL_EXIT / BREAK_EVEN ────────────────────
-                    elif status in (STATUS_PARTIAL_EXIT, STATUS_BREAK_EVEN):
-                        # Check break-even stop
-                        if sl2_id:
-                            sl2 = await loop.run_in_executor(
-                                None, lambda oid=sl2_id: self.trading_client.get_order_by_id(oid)
+                        async with state.lock:
+                            state.status = STATUS_COMPLETED
+                        if trade_db_id:
+                            await self.db.update_trade(
+                                trade_db_id,
+                                exit_price=fill_price,
+                                realized_pnl=pnl,
+                                status=db_status,
+                                closed_at=datetime.now(timezone.utc).isoformat(),
                             )
-                            if str(sl2.status).lower() == "filled":
-                                fill_price = round(float(sl2.filled_avg_price), 4)
-                                remaining  = state.entry_qty_requested - state.half_qty
-                                entry      = state.entry_price or fill_price
-                                pnl_be     = round(
-                                    (fill_price - entry) * remaining if state.side == "LONG"
-                                    else (entry - fill_price) * remaining,
-                                    2,
-                                )
-                                total_pnl = round(state.realized_pnl_tp1 + pnl_be, 2)
-                                async with state.lock:
-                                    state.status = STATUS_COMPLETED
-                                if trade_db_id:
-                                    await self.db.update_trade(
-                                        trade_db_id,
-                                        exit_price=fill_price,
-                                        realized_pnl=total_pnl,
-                                        status="CLOSED_BE",
-                                        closed_at=datetime.now(timezone.utc).isoformat(),
-                                    )
-                                logger.info(
-                                    "%s | BE STOP HIT @ %.4f  total_pnl=$%.2f",
-                                    state.symbol, fill_price, total_pnl,
-                                )
-                                await self.db.log_event(
-                                    "CLOSED_BE", f"{state.symbol} exit={fill_price:.4f} total_pnl={total_pnl:.2f}"
-                                )
-                                await self._email_exit(state.symbol, "CLOSED_BE", fill_price, pnl_be, total_pnl)
-                                continue
-
-                        # Check TP2 on order2
-                        if order2_id:
-                            o2 = await loop.run_in_executor(
-                                None, lambda oid=order2_id: self.trading_client.get_order_by_id(oid)
-                            )
-                            for leg in (o2.legs or []):
-                                if (str(getattr(leg, "status", "")).lower() == "filled"
-                                        and "limit" in str(getattr(leg, "order_type", "")).lower()):
-                                    fill_price = round(float(leg.filled_avg_price), 4)
-                                    remaining  = state.entry_qty_requested - state.half_qty
-                                    entry      = state.entry_price or fill_price
-                                    pnl_tp2    = round(
-                                        (fill_price - entry) * remaining if state.side == "LONG"
-                                        else (entry - fill_price) * remaining,
-                                        2,
-                                    )
-                                    total_pnl  = round(state.realized_pnl_tp1 + pnl_tp2, 2)
-                                    async with state.lock:
-                                        state.status = STATUS_COMPLETED
-                                    if trade_db_id:
-                                        await self.db.update_trade(
-                                            trade_db_id,
-                                            exit_price=fill_price,
-                                            realized_pnl=total_pnl,
-                                            status="CLOSED_TP2",
-                                            closed_at=datetime.now(timezone.utc).isoformat(),
-                                        )
-                                    logger.info(
-                                        "%s | TP2 HIT @ %.4f  total_pnl=$%.2f",
-                                        state.symbol, fill_price, total_pnl,
-                                    )
-                                    await self.db.log_event(
-                                        "CLOSED_TP2",
-                                        f"{state.symbol} exit={fill_price:.4f} total_pnl={total_pnl:.2f}",
-                                    )
-                                    await self._email_exit(state.symbol, "TP2_HIT", fill_price, pnl_tp2, total_pnl)
-                                    break
+                        await self.db.log_event(log_event, log_msg)
+                        await self._email_exit(state.symbol, db_status, fill_price, pnl)
+                        break
 
                 except Exception as exc:
                     logger.debug("Fill monitor error %s: %s", state.symbol, exc)
 
     async def _orphan_order_cleanup(self):
-        """Every 5 min: cancel both bracket legs if the position no longer exists."""
-        _live = (STATUS_IN_TRADE, STATUS_PARTIAL_EXIT, STATUS_BREAK_EVEN)
+        """Every 5 min: cancel bracket if the position no longer exists."""
         while not self.kill_switch_triggered:
             await asyncio.sleep(300)
             loop = asyncio.get_running_loop()
 
             for symbol, state in self.states.items():
                 async with state.lock:
-                    if state.status not in _live:
+                    if state.status != STATUS_IN_TRADE:
                         continue
                     trade_db_id = state.trade_db_id
-                    order_ids   = [o for o in (state.order1_id, state.order2_id, state.sl2_order_id) if o]
+                    order_ids   = [o for o in (state.order_id,) if o]
 
                 try:
                     try:
@@ -1541,10 +1167,9 @@ class ORBBot:
         # Backfill bars missed during the disconnect gap
         await self._backfill_missing_bars(loop)
 
-        _live = (STATUS_IN_TRADE, STATUS_PARTIAL_EXIT, STATUS_BREAK_EVEN)
         for symbol, state in self.states.items():
             async with state.lock:
-                if state.status in _live:
+                if state.status == STATUS_IN_TRADE:
                     trade_db_id = state.trade_db_id
                     if symbol not in open_symbols:
                         logger.warning("%s | Position closed during disconnect — COMPLETED", symbol)
@@ -1675,52 +1300,6 @@ class ORBBot:
         today = datetime.now(self.config.tz).strftime("%Y-%m-%d")
         await self._email_eod_summary(today)
 
-    async def _premarket_scanner_task(self):
-        """
-        Waits until 9:25 AM EST, runs the PreMarketScanner, and updates
-        self.active_symbols to the top qualifying symbols for the day.
-        If no symbols qualify (no gap/RVOL threshold met), falls back to the
-        full configured universe so the bot never sits idle.
-        """
-        tz  = self.config.tz
-        now = datetime.now(tz)
-        target = now.replace(hour=9, minute=25, second=0, microsecond=0)
-        wait   = max(0.0, (target - now).total_seconds())
-
-        if wait > 0:
-            logger.info("PreMarket scanner fires in %.0fs", wait)
-            await asyncio.sleep(wait)
-
-        logger.info("Running PreMarket scanner over universe: %s", self.config.symbols)
-        try:
-            hits = await self.scanner.scan(
-                universe=self.config.symbols,
-                gap_min_pct=self.config.gap_min_pct,
-                rvol_min=self.config.rvol_min,
-                top_n=self.config.scanner_top_n,
-            )
-
-            if hits:
-                self.active_symbols = {sym for sym, _, _ in hits}
-                for sym, gap, rvol in hits:
-                    if sym in self.states:
-                        self.states[sym].gap_pct = gap
-                        self.states[sym].rvol    = rvol
-                logger.info("Scanner selected: %s", [(s, f"{g:.1f}%", f"{r:.1f}x") for s, g, r in hits])
-                await self.db.log_event(
-                    "SCANNER_COMPLETE",
-                    "Selected: " + ", ".join(f"{s}(gap={g:.1f}%,rvol={r:.1f}x)" for s, g, r in hits),
-                )
-            else:
-                logger.warning("Scanner: no symbols met gap≥%.1f%% + rvol≥%.1f× — using full universe",
-                               self.config.gap_min_pct, self.config.rvol_min)
-                self.active_symbols = set(self.config.symbols)
-                await self.db.log_event("SCANNER_COMPLETE", "No qualifiers — using full universe")
-
-        except Exception as exc:
-            logger.error("PreMarket scanner failed: %s — using full universe", exc)
-            self.active_symbols = set(self.config.symbols)
-
     # ── Stream with Reconnection ───────────────────────────────────────────────
 
     async def _run_stream_with_reconnect(self):
@@ -1765,7 +1344,6 @@ class ORBBot:
 
         await self._resume_from_db()
 
-        # Subscribe to all universe symbols initially (scanner refines at 9:25 AM)
         self.stream.subscribe_bars(self.on_bar, *self.config.symbols)
 
         asyncio.create_task(self._risk_monitor())
@@ -1773,7 +1351,6 @@ class ORBBot:
         asyncio.create_task(self._order_fill_monitor())
         asyncio.create_task(self._orphan_order_cleanup())
         asyncio.create_task(self._heartbeat_watchdog())
-        asyncio.create_task(self._premarket_scanner_task())
 
         await self._run_stream_with_reconnect()
 

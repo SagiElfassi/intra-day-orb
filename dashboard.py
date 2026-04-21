@@ -200,14 +200,10 @@ def load_config() -> dict:
         max_position_usd=0,
         min_atr_pct=2.0,
         max_spread_pct=0.05,
-        gap_min_pct=1.5,
-        rvol_min=2.0,
-        scanner_top_n=5,
         vwap_filter=True,
         volume_surge_mult=1.5,
         risk_pct_equity=1.0,
-        tp1_r=1.0,
-        tp2_r=3.0,
+        risk_ratio=2.0,
         atr_sl_mult=1.5,
     )
     if os.path.exists(CONFIG_PATH):
@@ -739,16 +735,21 @@ def build_bt_day_chart(trade_row: pd.Series, day_bars: pd.DataFrame) -> go.Figur
 
     entry_ts   = pd.to_datetime(trade_row["entry_time"])
     flatten_ts = entry_ts.normalize().replace(hour=15, minute=55)
-    fig.add_vline(x=flatten_ts.timestamp() * 1000,
-                  line_dash="dot", line_color="#546e7a", line_width=1,
-                  annotation_text="3:55 Flatten", annotation_position="top right",
-                  annotation_font_color="#546e7a")
+    fig.add_shape(
+        type="line", x0=flatten_ts, x1=flatten_ts, y0=0, y1=1,
+        xref="x", yref="paper",
+        line=dict(dash="dot", color="#546e7a", width=1),
+    )
+    fig.add_annotation(
+        x=flatten_ts, y=1, xref="x", yref="paper",
+        text="3:55 Flatten", showarrow=False,
+        xanchor="left", yanchor="top",
+        font=dict(color="#546e7a", size=10),
+    )
 
-    tp1_px  = trade_row.get("tp1_price", 0.0) or 0.0
-    tp2_px  = trade_row.get("tp2_price", 0.0) or 0.0
     entry   = trade_row["entry_price"]
     sl      = trade_row["stop_loss"]
-    scale_out_trade = tp1_px > 0 and tp2_px > 0 and abs(tp1_px - tp2_px) > 0.001
+    tp_px   = trade_row.get("take_profit", 0.0) or trade_row.get("tp1_price", 0.0) or 0.0
 
     fig.add_hline(y=entry, line_dash="solid", line_color="#82b1ff", line_width=1.5,
                   annotation_text=f"Entry  {entry:.2f}", annotation_position="right",
@@ -756,31 +757,17 @@ def build_bt_day_chart(trade_row: pd.Series, day_bars: pd.DataFrame) -> go.Figur
     fig.add_hline(y=sl, line_dash="dash", line_color="#ef5350", line_width=1.5,
                   annotation_text=f"SL  {sl:.2f}", annotation_position="right",
                   annotation_font_color="#ef5350")
-
-    if scale_out_trade:
-        fig.add_hline(y=tp1_px, line_dash="dash", line_color="#69f0ae", line_width=1.5,
-                      annotation_text=f"TP1  {tp1_px:.2f}", annotation_position="right",
-                      annotation_font_color="#69f0ae")
-        fig.add_hline(y=tp2_px, line_dash="dash", line_color="#00e676", line_width=2,
-                      annotation_text=f"TP2  {tp2_px:.2f}", annotation_position="right",
+    if tp_px:
+        fig.add_hline(y=tp_px, line_dash="dash", line_color="#00e676", line_width=1.5,
+                      annotation_text=f"TP  {tp_px:.2f}", annotation_position="right",
                       annotation_font_color="#00e676")
-        fig.add_annotation(x=1.01, xref="paper", y=entry,
-                           text="B/E after TP1", showarrow=False,
-                           xanchor="left", yanchor="bottom",
-                           font=dict(size=9, color="#82b1ff"))
-    else:
-        tp_px = tp2_px if tp2_px > 0 else trade_row.get("take_profit", 0.0)
-        if tp_px:
-            fig.add_hline(y=tp_px, line_dash="dash", line_color="#00e676", line_width=1.5,
-                          annotation_text=f"TP  {tp_px:.2f}", annotation_position="right",
-                          annotation_font_color="#00e676")
 
     _exit_colors = {
-        "TP": "#00e676", "TP1": "#69f0ae", "TP2": "#00e676",
-        "SL": "#ef5350", "BE": "#82b1ff",  "EOD": "#FF6F00",
+        "TP": "#00e676", "CLOSED_TP": "#00e676",
+        "SL": "#ef5350", "CLOSED_SL": "#ef5350",
+        "EOD": "#FF6F00",
     }
     exit_reason = trade_row.get("exit_reason", "")
-    leg1_reason = trade_row.get("leg1_exit", "")
 
     side = trade_row.get("side", "LONG")
     try:
@@ -798,19 +785,6 @@ def build_bt_day_chart(trade_row: pd.Series, day_bars: pd.DataFrame) -> go.Figur
         ))
     except Exception:
         pass
-
-    if scale_out_trade and leg1_reason == "TP1":
-        try:
-            fig.add_trace(go.Scatter(
-                x=[entry_ts], y=[tp1_px],
-                mode="markers",
-                marker=dict(symbol="circle", size=10,
-                            color="#69f0ae", line=dict(color="#fff", width=1)),
-                name="TP1 hit",
-                hovertemplate="TP1 hit<br>$%{y:.2f}<extra></extra>",
-            ))
-        except Exception:
-            pass
 
     if pd.notna(trade_row.get("exit_time")) and pd.notna(trade_row.get("exit_price")):
         try:
@@ -1061,7 +1035,7 @@ st_components.html("""
 st.divider()
 
 # ── Row 1: trading params ─────────────────────────────────────────────────────
-_r1c1, _r1c2, _r1c3, _r1c4, _r1c5, _r1c6, _r1c7, _r1c8 = st.columns([2.5, 1, 1, 1.0, 0.9, 1.0, 1.0, 1.1])
+_r1c1, _r1c2, _r1c3, _r1c4, _r1c5, _r1c6 = st.columns([2.5, 1, 1, 1.0, 1.0, 1.1])
 
 with _r1c1:
     sym_input = st.text_input(
@@ -1098,44 +1072,15 @@ with _r1c4:
     )
 
 with _r1c5:
-    _tp_mode_default = int(cfg.get("tp_legs", 2))
-    tp_legs = st.radio(
-        "TP Mode",
-        [2, 1],
-        index=0 if _tp_mode_default == 2 else 1,
-        format_func=lambda x: "2 TP" if x == 2 else "1 TP",
-        horizontal=False,
-        help="2 TP = scale-out (50%+50%). 1 TP = full position exits at single target.",
+    risk_ratio = st.number_input(
+        "R:R Ratio",
+        0.5, 10.0,
+        float(cfg.get("risk_ratio", 2.0)),
+        0.25, format="%.2f",
+        help="Take-profit = entry ± ORB range × R:R ratio",
     )
-    two_tp = (tp_legs == 2)
 
 with _r1c6:
-    if two_tp:
-        tp1_r = st.number_input(
-            "TP1 (R)",
-            0.5, 5.0,
-            float(cfg["tp1_r"]),
-            0.25, format="%.2f",
-            help="First target — 50% of position exits here",
-        )
-    else:
-        tp1_r = 0.0
-        st.caption("TP1")
-        st.caption("— (1 TP mode)")
-
-with _r1c7:
-    _tp2_label = "TP2 (R)" if two_tp else "TP (R)"
-    _tp2_help  = ("Second target — remaining 50% (risk-free after TP1)"
-                  if two_tp else "Single take-profit — full position exits here")
-    tp2_r = st.number_input(
-        _tp2_label,
-        0.5, 10.0,
-        float(cfg["tp2_r"]),
-        0.25, format="%.2f",
-        help=_tp2_help,
-    )
-
-with _r1c8:
     max_position_usd = st.number_input(
         "Max $ / Symbol",
         0, 500_000,
@@ -1145,7 +1090,7 @@ with _r1c8:
     )
 
 # ── Row 2: filters ────────────────────────────────────────────────────────────
-_r2c1, _r2c2, _r2c3, _r2c4, _r2c5, _r2c6, _r2c7, _r2c8 = st.columns(8)
+_r2c1, _r2c2, _r2c3, _r2c4, _r2c5, _r2c6 = st.columns(6)
 
 with _r2c1:
     vwap_filter = st.toggle(
@@ -1192,31 +1137,17 @@ with _r2c5:
     )
 
 with _r2c6:
-    gap_min_pct = st.number_input(
-        "Gap Min %",
-        0.0, 20.0,
-        float(cfg.get("gap_min_pct", 1.5)),
-        0.1, format="%.1f",
-        help="Pre-market scanner: min overnight gap vs prior close",
-    )
-
-with _r2c7:
-    rvol_min = st.number_input(
-        "Min RVOL ×",
-        0.5, 20.0,
-        float(cfg.get("rvol_min", 2.0)),
-        0.1, format="%.1f",
-        help="Pre-market scanner: min relative volume (pm vs 20-day avg)",
-    )
-
-with _r2c8:
-    scanner_top_n = st.number_input(
-        "Top N",
-        1, 20,
-        int(cfg.get("scanner_top_n", 5)),
-        1,
-        help="Pre-market scanner: keep top N symbols by score each day",
-    )
+    _default_cutoff = cfg.get("last_entry_time", "11:00")
+    last_entry_time = st.text_input(
+        "Last Entry",
+        value=_default_cutoff,
+        help="No new entries after this time EST (HH:MM, 24-hour)",
+    ).strip()
+    try:
+        _leh, _lem = [int(x) for x in last_entry_time.split(":")]
+    except Exception:
+        _leh, _lem = 11, 0
+        last_entry_time = "11:00"
 
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1230,16 +1161,12 @@ if _save_now:
         min_orb_volume=min_orb_volume,
         min_atr_pct=min_atr_pct,
         max_spread_pct=max_spread_pct,
-        gap_min_pct=gap_min_pct,
-        rvol_min=rvol_min,
-        scanner_top_n=int(scanner_top_n),
         vwap_filter=vwap_filter,
         volume_surge_mult=volume_surge_mult,
         risk_pct_equity=risk_pct_equity,
-        tp1_r=tp1_r,
-        tp2_r=tp2_r,
-        tp_legs=int(tp_legs),
+        risk_ratio=float(risk_ratio),
         max_position_usd=int(max_position_usd),
+        last_entry_time=last_entry_time,
     )
     save_config(new_cfg)
     cfg = new_cfg
@@ -1253,8 +1180,8 @@ if _run_test:
 #  TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab_live, tab_bt, tab_scanner, tab_rules = st.tabs([
-    "📡  Live Trading", "🔬  Backtest", "🔭  Scanner", "📐  Strategy Rules"
+tab_live, tab_bt, tab_rules = st.tabs([
+    "📡  Live Trading", "🔬  Backtest", "📐  Strategy Rules"
 ])
 
 
@@ -1405,21 +1332,11 @@ def render_live_tab():
                         _qty    = _qty_risk
                         _capped = False
 
-                    _half     = _qty // 2
-                    _rem      = _qty - _half
                     _notional = round(_qty * _rh, 0)
                     _cap_note = f"  *(capped from {_qty_risk} by ${max_position_usd:,} limit)*" if _capped else ""
 
-                    if two_tp:
-                        _tp1_est = round(_rh + _rps * tp1_r, 2)
-                        _tp2_est = round(_rh + _rps * tp2_r, 2)
-                        tp_lines = (
-                            f"- TP1: `{_tp1_est:.2f}` (+{tp1_r:.1f}R) · {_half} shares\n"
-                            f"- TP2: `{_tp2_est:.2f}` (+{tp2_r:.1f}R) · {_rem} shares"
-                        )
-                    else:
-                        _tp_est  = round(_rh + _rps * tp2_r, 2)
-                        tp_lines = f"- TP: `{_tp_est:.2f}` (+{tp2_r:.1f}R) · {_qty} shares"
+                    _tp_est  = round(_rh + _span * risk_ratio, 2)
+                    tp_lines = f"- TP: `{_tp_est:.2f}` (+{risk_ratio:.1f}× ORB range) · {_qty} shares"
 
                     st.markdown(f"""
 **Est. Position (long signal)**
@@ -1452,7 +1369,7 @@ with tab_bt:
         f"All strategy rules are applied: ORB={orb_minutes} min · SL={sl_type} · "
         f"VWAP={'on' if vwap_filter else 'off'} · Surge={volume_surge_mult:.1f}× · "
         f"Min ORB Vol={min_orb_volume//1000:,}K · Min ATR={min_atr_pct:.1f}% · "
-        f"{'TP1=' + str(round(tp1_r,2)) + 'R / TP2=' if two_tp else 'TP='}{tp2_r:.2f}R · Risk {risk_pct_equity:.1f}% equity"
+        f"TP={risk_ratio:.2f}R · Risk {risk_pct_equity:.1f}% equity"
     )
 
     bc1, bc2, bc3 = st.columns(3)
@@ -1477,27 +1394,26 @@ with tab_bt:
             if not api_key:
                 st.error("ALPACA_API_KEY not set. Add it to .env or environment.")
             else:
-                _mode_label = f"2 TP  TP1={tp1_r:.2f}R / TP2={tp2_r:.2f}R" if two_tp else f"1 TP  TP={tp2_r:.2f}R"
-                with st.spinner(f"Backtesting {bt_symbol}  {bt_start} → {bt_end}  [{_mode_label}]…"):
+                with st.spinner(f"Backtesting {bt_symbol}  {bt_start} → {bt_end}  [TP={risk_ratio:.2f}R]…"):
                     engine = BacktestEngine(api_key, api_secret)
                     result = engine.run_backtest(
-                        symbol            = bt_symbol,
-                        start_date        = bt_start,
-                        end_date          = bt_end,
-                        orb_minutes       = orb_minutes,
-                        stop_loss_type    = sl_type,
-                        slippage_bps      = bt_slippage,
-                        risk_ratio        = tp2_r,       # used only in 1-TP mode
-                        tp1_r             = tp1_r,       # 0.0 when 1-TP mode
-                        tp2_r             = tp2_r,
-                        risk_pct_equity   = risk_pct_equity,
-                        starting_equity   = float(bt_equity),
-                        vwap_filter       = vwap_filter,
-                        volume_surge_mult = volume_surge_mult,
-                        min_orb_volume    = min_orb_volume,
-                        min_atr_pct       = min_atr_pct,
-                        max_position_usd  = float(max_position_usd),
-                        atr_sl_mult       = cfg.get("atr_sl_mult", 1.5),
+                        symbol                    = bt_symbol,
+                        start_date                = bt_start,
+                        end_date                  = bt_end,
+                        orb_minutes               = orb_minutes,
+                        stop_loss_type            = sl_type,
+                        slippage_bps              = bt_slippage,
+                        risk_ratio                = risk_ratio,
+                        risk_pct_equity           = risk_pct_equity,
+                        starting_equity           = float(bt_equity),
+                        vwap_filter               = vwap_filter,
+                        volume_surge_mult         = volume_surge_mult,
+                        min_orb_volume            = min_orb_volume,
+                        min_atr_pct               = min_atr_pct,
+                        max_position_usd          = float(max_position_usd),
+                        atr_sl_mult               = cfg.get("atr_sl_mult", 1.5),
+                        trading_window_end_hour   = _leh,
+                        trading_window_end_minute = _lem,
                     )
 
                 if result.error:
@@ -1545,8 +1461,6 @@ with tab_bt:
                  exit_reason=t.exit_reason, qty=t.qty,
                  pnl=t.pnl, r_multiple=t.r_multiple,
                  entry_time=t.entry_time, exit_time=t.exit_time,
-                 tp1_price=t.tp1_price, tp2_price=t.tp2_price,
-                 leg1_exit=t.leg1_exit_reason, leg1_pnl=t.leg1_pnl,
                  fees=t.fees)
             for t in trades_list
         ])
@@ -1562,11 +1476,10 @@ with tab_bt:
         st.subheader("Trade Log")
 
         _exit_icons = {
-            "TP":  "✅ TP",  "TP2": "✅ TP2", "TP1": "✅ TP1",
-            "SL":  "❌ SL",  "BE":  "↩️ BE",
-            "EOD": "🕐 EOD",
+            "TP":        "✅ TP",  "CLOSED_TP": "✅ TP",
+            "SL":        "❌ SL",  "CLOSED_SL": "❌ SL",
+            "EOD":       "🕐 EOD",
         }
-        _l1_icons = {"TP1": "✅ TP1", "SL": "❌ SL", "EOD": "🕐 EOD", "": ""}
 
         display = trades_df_bt.copy()
         display["#"]     = range(1, len(display) + 1)
@@ -1575,24 +1488,18 @@ with tab_bt:
         display["PnL"]   = display["pnl"].map(lambda x: f"+${x:.2f}" if x >= 0 else f"-${abs(x):.2f}")
         display["R"]     = display["r_multiple"].map(lambda x: f"+{x:.2f}R" if x >= 0 else f"{x:.2f}R")
         display["Fees"]  = display["fees"].map(lambda x: f"${x:.3f}")
-        display["Leg1"]     = display["leg1_exit"].map(lambda x: _l1_icons.get(x, x))
-        display["Leg1 PnL"] = display["leg1_pnl"].map(lambda x: f"+${x:.2f}" if x >= 0 else f"-${abs(x):.2f}")
-
         show_cols = [
-            "#", "date", "Side", "entry_price", "tp1_price", "tp2_price", "stop_loss",
-            "exit_price", "Leg1", "Leg1 PnL", "Final", "qty", "PnL", "R", "Fees",
+            "#", "date", "Side", "entry_price", "take_profit", "stop_loss",
+            "exit_price", "Final", "qty", "PnL", "R", "Fees",
         ]
         col_cfg = {
-            "#":           st.column_config.NumberColumn(width="small"),
-            "date":        st.column_config.TextColumn("Date", width="small"),
-            "Side":        st.column_config.TextColumn(width="small"),
-            "entry_price": st.column_config.NumberColumn("Entry", format="$%.2f", width="small"),
-            "tp1_price":   st.column_config.NumberColumn("TP1", format="$%.2f", width="small"),
-            "tp2_price":   st.column_config.NumberColumn("TP2", format="$%.2f", width="small"),
+            "#":            st.column_config.NumberColumn(width="small"),
+            "date":         st.column_config.TextColumn("Date", width="small"),
+            "Side":         st.column_config.TextColumn(width="small"),
+            "entry_price":  st.column_config.NumberColumn("Entry", format="$%.2f", width="small"),
+            "take_profit":  st.column_config.NumberColumn("TP", format="$%.2f", width="small"),
             "stop_loss":   st.column_config.NumberColumn("SL", format="$%.2f", width="small"),
             "exit_price":  st.column_config.NumberColumn("Avg Exit", format="$%.2f", width="small"),
-            "Leg1":        st.column_config.TextColumn(width="small"),
-            "Leg1 PnL":    st.column_config.TextColumn(width="small"),
             "Final":       st.column_config.TextColumn(width="small"),
             "qty":         st.column_config.NumberColumn("Qty", width="small"),
             "PnL":         st.column_config.TextColumn(width="small"),
@@ -1663,252 +1570,15 @@ with tab_bt:
 # Uses all filter/strategy settings from the top bar.
 # Scanner-only params: universe, lookback period, rank metric.
 
-SCAN_UNIVERSE_DEFAULT = (
-    "SPY, QQQ, IWM, AAPL, NVDA, META, TSLA, AMZN, MSFT, GOOGL, AMD, "
-    "COIN, PLTR, NFLX, JPM, GS, MSTR, HOOD, SOFI, IONQ"
-)
-
-with tab_scanner:
-    st.caption(
-        f"All strategy rules are applied: ORB={orb_minutes} min · SL={sl_type} · "
-        f"VWAP={'on' if vwap_filter else 'off'} · Surge={volume_surge_mult:.1f}× · "
-        f"Min ORB Vol={min_orb_volume//1000:,}K · Min ATR={min_atr_pct:.1f}% · "
-        f"TP1={tp1_r:.2f}R / TP2={tp2_r:.2f}R · Risk {risk_pct_equity:.1f}% equity"
-    )
-
-    scn_col1, scn_col2, scn_col3 = st.columns([3, 1, 1])
-    with scn_col1:
-        universe_input = st.text_area(
-            "Stock Universe (comma-separated)",
-            value=SCAN_UNIVERSE_DEFAULT,
-            height=80,
-            key="scan_universe",
-        )
-        scan_symbols = [s.strip().upper() for s in universe_input.split(",") if s.strip()]
-        st.caption(f"{len(scan_symbols)} symbols loaded")
-
-    with scn_col2:
-        scan_days = st.selectbox(
-            "Lookback Period", [7, 14, 30, 60, 90], index=1,
-            format_func=lambda x: f"{x} days", key="scan_days",
-        )
-
-    with scn_col3:
-        rank_by = st.selectbox(
-            "Rank By",
-            ["Total P&L", "Profit Factor", "Win Rate %", "Avg R", "Expectancy", "Sharpe", "# Trades"],
-            key="scan_rank",
-        )
-
-    scan_btn = st.button("🔭  Run Scanner", type="primary", key="scan_run")
-
-    if scan_btn:
-        api_key, api_secret = get_alpaca_credentials(alpaca_paper)
-        if not api_key:
-            st.error("API keys not configured.")
-        else:
-            from backtest import BacktestEngine
-            scan_end   = date.today() - timedelta(days=1)
-            scan_start = scan_end - timedelta(days=scan_days)
-
-            scan_rows = []
-            prog = st.progress(0, text="Starting scan…")
-
-            for i, sym in enumerate(scan_symbols):
-                prog.progress((i + 1) / len(scan_symbols),
-                              text=f"Scanning {sym}  ({i+1}/{len(scan_symbols)})")
-                try:
-                    result = BacktestEngine(api_key, api_secret).run_backtest(
-                        symbol            = sym,
-                        start_date        = scan_start,
-                        end_date          = scan_end,
-                        orb_minutes       = orb_minutes,
-                        stop_loss_type    = sl_type,
-                        risk_ratio        = tp2_r,
-                        tp1_r             = tp1_r,
-                        tp2_r             = tp2_r,
-                        risk_pct_equity   = risk_pct_equity,
-                        starting_equity   = 100_000.0,
-                        vwap_filter       = vwap_filter,
-                        volume_surge_mult = volume_surge_mult,
-                        min_orb_volume    = min_orb_volume,
-                        min_atr_pct       = min_atr_pct,
-                        max_position_usd  = float(max_position_usd),
-                        atr_sl_mult       = cfg.get("atr_sl_mult", 1.5),
-                    )
-                    if result.error or not result.trades:
-                        scan_rows.append({"Symbol": sym, "_no_trade": True,
-                                          "_reason": result.error or "no signals"})
-                        continue
-                    s = result.stats
-                    scan_rows.append({
-                        "Symbol":        sym,
-                        "Trades":        s.total_trades,
-                        "Win Rate %":    s.win_rate,
-                        "Total P&L":     round(s.total_pnl, 2),
-                        "Profit Factor": round(s.profit_factor, 2) if s.profit_factor != float("inf") else 999.0,
-                        "Avg R":         round(s.avg_r_multiple, 2),
-                        "Expectancy":    round(s.expectancy, 2),
-                        "Sharpe":        round(s.sharpe_ratio, 2),
-                        "Max DD ($)":    round(s.max_drawdown, 2),
-                        "Avg Win":       round(s.avg_win, 2),
-                        "Avg Loss":      round(s.avg_loss, 2),
-                        "Total Fees":    round(s.total_fees, 2),
-                        "Skipped Days":  len(result.skipped_days),
-                        "_no_trade":     False,
-                        "_reason":       "",
-                    })
-                except Exception as exc:
-                    scan_rows.append({"Symbol": sym, "_no_trade": True, "_reason": str(exc)})
-
-            prog.empty()
-            st.session_state["scan_results"] = scan_rows
-            st.session_state["scan_meta"] = {
-                "days": scan_days, "orb": orb_minutes,
-                "start": str(scan_start), "end": str(scan_end),
-                "tp1_r": tp1_r, "tp2_r": tp2_r,
-                "risk_pct": risk_pct_equity,
-                "vwap": vwap_filter, "surge": volume_surge_mult,
-            }
-
-    if "scan_results" in st.session_state:
-        scan_rows = st.session_state["scan_results"]
-        meta      = st.session_state.get("scan_meta", {})
-
-        traded     = [r for r in scan_rows if not r.get("_no_trade")]
-        no_signals = [r for r in scan_rows if r.get("_no_trade")]
-
-        if not traded:
-            st.warning("No symbols generated trades in the selected period.")
-        else:
-            rank_col_map = {
-                "Total P&L":    "Total P&L",
-                "Profit Factor":"Profit Factor",
-                "Win Rate %":   "Win Rate %",
-                "Avg R":        "Avg R",
-                "Expectancy":   "Expectancy",
-                "Sharpe":       "Sharpe",
-                "# Trades":     "Trades",
-            }
-            sort_col = rank_col_map.get(rank_by, "Total P&L")
-            df_scan  = pd.DataFrame(traded).sort_values(sort_col, ascending=False).reset_index(drop=True)
-            df_scan.index = range(1, len(df_scan) + 1)
-
-            period_label = (
-                f"{meta.get('start','?')} → {meta.get('end','?')}  ·  "
-                f"{meta.get('orb','?')}-min ORB  ·  "
-                f"TP1={meta.get('tp1_r',0):.1f}R / TP2={meta.get('tp2_r',0):.1f}R  ·  "
-                f"VWAP={'on' if meta.get('vwap') else 'off'}  ·  "
-                f"Surge={meta.get('surge',0):.1f}×"
-            )
-            st.markdown(f"**{len(df_scan)} symbols with trades** — {period_label}")
-
-            top = df_scan.iloc[0]
-            m1, m2, m3, m4, m5, m6 = st.columns(6)
-            m1.metric("🏆 Top Symbol",  top["Symbol"])
-            m2.metric("Total P&L",      f"${top['Total P&L']:+,.2f}")
-            m3.metric("Win Rate",        f"{top['Win Rate %']:.0f}%")
-            m4.metric("Profit Factor",   f"{top['Profit Factor']:.2f}")
-            m5.metric("Expectancy",      f"${top['Expectancy']:+.2f}")
-            m6.metric("Sharpe",          f"{top['Sharpe']:.2f}")
-
-            st.divider()
-
-            display_cols = ["Symbol", "Trades", "Win Rate %", "Total P&L",
-                            "Profit Factor", "Avg R", "Expectancy", "Sharpe",
-                            "Max DD ($)", "Total Fees", "Skipped Days"]
-            st.dataframe(
-                df_scan[display_cols],
-                use_container_width=True,
-                column_config={
-                    "Symbol":        st.column_config.TextColumn(width="small"),
-                    "Trades":        st.column_config.NumberColumn(width="small"),
-                    "Win Rate %":    st.column_config.NumberColumn(format="%.0f%%", width="small"),
-                    "Total P&L":     st.column_config.NumberColumn(format="$%+.2f"),
-                    "Profit Factor": st.column_config.NumberColumn(format="%.2f", width="small"),
-                    "Avg R":         st.column_config.NumberColumn(format="%.2f", width="small"),
-                    "Expectancy":    st.column_config.NumberColumn(format="$%+.2f"),
-                    "Sharpe":        st.column_config.NumberColumn(format="%.2f", width="small"),
-                    "Max DD ($)":    st.column_config.NumberColumn(format="$%.2f"),
-                    "Total Fees":    st.column_config.NumberColumn(format="$%.2f"),
-                    "Skipped Days":  st.column_config.NumberColumn(width="small"),
-                },
-            )
-
-            st.divider()
-            st.subheader("Top 5 Equity Curves")
-            top5 = df_scan.head(5)["Symbol"].tolist()
-            api_key_scan, api_secret_scan = get_alpaca_credentials(alpaca_paper)
-            scan_end_d   = date.today() - timedelta(days=1)
-            scan_start_d = scan_end_d - timedelta(days=meta.get("days", scan_days))
-
-            @st.cache_data(ttl=3600)
-            def _scan_equity(s, sd, ed, orb, slt, key, sec, tp1, tp2, rpe, eq, vwap, surge, min_vol, min_atr):
-                from backtest import BacktestEngine as _BTE
-                r = _BTE(key, sec).run_backtest(
-                    symbol=s, start_date=sd, end_date=ed,
-                    orb_minutes=orb, stop_loss_type=slt,
-                    tp1_r=tp1, tp2_r=tp2, risk_pct_equity=rpe,
-                    starting_equity=eq, vwap_filter=vwap, volume_surge_mult=surge,
-                    min_orb_volume=min_vol, min_atr_pct=min_atr,
-                )
-                if r.trades:
-                    return pd.DataFrame({"pnl": [t.pnl for t in r.trades]})
-                return pd.DataFrame()
-
-            eq_cols = st.columns(min(len(top5), 5))
-            for col, sym in zip(eq_cols, top5):
-                with col:
-                    sym_row = df_scan[df_scan["Symbol"] == sym].iloc[0]
-                    pnl_color = "#00e676" if sym_row["Total P&L"] >= 0 else "#ef5350"
-                    st.caption(f"**{sym}** — ${sym_row['Total P&L']:+,.0f}")
-                    try:
-                        eq_df = _scan_equity(
-                            sym, scan_start_d, scan_end_d,
-                            meta.get("orb", orb_minutes), sl_type,
-                            api_key_scan, api_secret_scan,
-                            meta.get("tp1_r", 0.0), meta.get("tp2_r", 0.0),
-                            meta.get("risk_pct", 0.0), 100_000.0,
-                            meta.get("vwap", False), meta.get("surge", 0.0),
-                            min_orb_volume, min_atr_pct,
-                        )
-                        if not eq_df.empty:
-                            fig_mini = go.Figure(go.Scatter(
-                                y=eq_df["pnl"].cumsum(),
-                                mode="lines",
-                                line=dict(color=pnl_color, width=2),
-                                fill="tozeroy",
-                                fillcolor=f"rgba({'0,230,118' if pnl_color == '#00e676' else '239,83,80'},0.08)",
-                            ))
-                            fig_mini.update_layout(
-                                height=140, margin=dict(l=0, r=0, t=0, b=0),
-                                showlegend=False,
-                                xaxis=dict(visible=False),
-                                yaxis=dict(tickformat="$,.0f", tickfont=dict(size=9)),
-                            )
-                            _dark_layout(fig_mini)
-                            st.plotly_chart(fig_mini, use_container_width=True)
-                    except Exception:
-                        st.caption("chart unavailable")
-
-        if no_signals:
-            with st.expander(f"⚠️ No signals — {len(no_signals)} symbols", expanded=False):
-                st.dataframe(
-                    pd.DataFrame([{"Symbol": r["Symbol"], "Reason": r["_reason"]}
-                                  for r in no_signals]),
-                    use_container_width=True, hide_index=True,
-                )
-
-
-# ── TAB 4 : STRATEGY RULES ────────────────────────────────────────────────────
+# ── TAB 3 : STRATEGY RULES ────────────────────────────────────────────────────
 
 with tab_rules:
 
     st.subheader("Dynamic Momentum ORB — Complete Strategy Rules")
     st.caption(
         f"All values reflect the current settings bar: "
-        f"**{orb_minutes}-min ORB · Gap ≥{gap_min_pct:.1f}% · RVOL ≥{rvol_min:.1f}× · "
-        f"Risk {risk_pct_equity:.1f}% equity · TP1={tp1_r:.1f}R / TP2={tp2_r:.1f}R · "
+        f"**{orb_minutes}-min ORB · Risk {risk_pct_equity:.1f}% equity · "
+        f"TP={risk_ratio:.2f}R · "
         f"VWAP={'on' if vwap_filter else 'off'} · Surge={volume_surge_mult:.1f}× · "
         f"Min ORB Vol={min_orb_volume:,} · Min ATR={min_atr_pct:.1f}%**"
     )
@@ -1918,80 +1588,50 @@ with tab_rules:
     st.markdown("### Strategy Overview")
 
     st.info("""
-**Dynamic Momentum ORB** combines pre-market scanning with intraday momentum confirmation to produce a high-quality trade list every morning.
+**Dynamic Momentum ORB** uses intraday momentum confirmation to produce high-quality setups each morning.
 
-- **Pre-market scanner** (4:00 AM – 9:25 AM) ranks stocks by overnight gap and relative volume; only the top N symbols trade that day.
 - **Analyst filters** (ORB volume + 14-day ATR) discard low-liquidity and low-volatility days.
 - **Intraday momentum filters** (VWAP alignment + volume surge) confirm genuine breakout momentum before any order is sent.
 - **Volatility-adjusted sizing** risks a fixed % of account equity per trade — position size automatically scales with the stock's move potential.
-- **Two-leg scale-out** locks in profits at TP1 and moves the SL to break-even, letting the second half ride to TP2 risk-free.
+- **Single take-profit bracket** exits the full position at the configured R:R target.
 - **Bracket orders** sent to Alpaca ensure exits are broker-managed even if the bot crashes.
 - **Auto-flatten at 3:55 PM** eliminates overnight exposure.
     """)
 
     ov1, ov2, ov3, ov4 = st.columns(4)
     with ov1:
-        st.metric("TP1 Target", f"{tp1_r:.1f}R", "50% of position")
+        st.metric("TP Target", f"{risk_ratio:.2f}R", "full position")
     with ov2:
-        st.metric("TP2 Target", f"{tp2_r:.1f}R", "remaining 50%")
+        st.metric("Risk:Reward", f"1:{risk_ratio:.2f}", "per trade")
     with ov3:
         st.metric("Risk per trade", f"{risk_pct_equity:.1f}% equity", "volatility-adjusted")
     with ov4:
-        st.metric("Top N symbols", str(int(scanner_top_n)), "from pre-market scan")
+        st.metric("Universe", str(len(symbols)), "configured symbols")
 
     # ── Consistency note ──────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### Rule Consistency: Live Bot · Backtest · Scanner")
+    st.markdown("### Rule Consistency: Live Bot · Backtest")
 
     st.markdown("""
-| Rule | Live Bot | Backtest | Scanner | Notes |
-|------|----------|----------|---------|-------|
-| Pre-market scanner (gap + RVOL) | ✅ Runs 4 AM–9:25 AM | n/a | n/a | Bot selects symbols; backtest tests specific ones |
-| Min bars required (≥ 13 of ORB window) | ✅ | ✅ | ✅ | Guards against data gaps at open |
-| Min ORB Volume | ✅ | ✅ | ✅ | Same threshold from settings bar |
-| Min ATR % (14-day) | ✅ | ✅ | ✅ | Same threshold from settings bar |
-| Price breakout (close > ORB High / < ORB Low) | ✅ | ✅ | ✅ | Identical logic |
-| VWAP filter | ✅ | ✅ | ✅ | Toggle in settings bar controls all three |
-| Volume surge filter | ✅ | ✅ | ✅ | Multiplier in settings bar controls all three |
-| Bid-ask spread filter | ✅ Live quotes | ⚠️ Not applied | ⚠️ Not applied | No historical quote data available |
-| Two-leg scale-out (TP1 + TP2 + B/E) | ✅ Always | ✅ Always | ✅ Always | Single-leg mode removed |
-| Volatility-adjusted sizing (risk % equity) | ✅ Always | ✅ Always | ✅ Always | Fixed-USD mode removed |
-| Auto-flatten 3:55 PM | ✅ | ✅ (simulated) | ✅ (simulated) | EOD exit recorded |
-| Kill switch (daily loss %) | ✅ Bot only | n/a | n/a | Portfolio-level guard |
+| Rule | Live Bot | Backtest | Notes |
+|------|----------|----------|-------|
+| Min bars required (≥ 13 of ORB window) | ✅ | ✅ | Guards against data gaps at open |
+| Min ORB Volume | ✅ | ✅ | Same threshold from settings bar |
+| Min ATR % (14-day) | ✅ | ✅ | Same threshold from settings bar |
+| Price breakout (close > ORB High / < ORB Low) | ✅ | ✅ | Identical logic |
+| VWAP filter | ✅ | ✅ | Toggle in settings bar controls both |
+| Volume surge filter | ✅ | ✅ | Multiplier in settings bar controls both |
+| Bid-ask spread filter | ✅ Live quotes | ⚠️ Not applied | No historical quote data available |
+| Single take-profit (full position) | ✅ | ✅ | TP = entry ± ORB range × R:R ratio |
+| Volatility-adjusted sizing (risk % equity) | ✅ Always | ✅ Always | Fixed-USD mode removed |
+| Auto-flatten 3:55 PM | ✅ | ✅ (simulated) | EOD exit recorded |
+| Kill switch (daily loss %) | ✅ Bot only | n/a | Portfolio-level guard |
 
 > **Spread filter caveat:** The bid-ask spread check is the only rule that differs.
 > Historical minute bars do not include real-time quotes, so it cannot be simulated.
 > Backtest results are therefore slightly optimistic for thinly-traded names.
 > Set `Max Spread %` conservatively and the real bot will auto-filter those out at execution time.
     """)
-
-    # ── Phase 0 ───────────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### Phase 0 · Pre-Market Scanner  *(4:00 AM → 9:25 AM, live bot only)*")
-
-    sc1, sc2 = st.columns([1, 1])
-    with sc1:
-        st.markdown(f"""
-| Metric | Formula | Threshold |
-|--------|---------|-----------|
-| **Gap %** | `(first_pm_open − prev_close) / prev_close × 100` | ≥ **{gap_min_pct:.1f}%** |
-| **RVOL** | `(pm_vol / 325 min) ÷ (avg_daily_vol / 390 min)` | ≥ **{rvol_min:.1f}×** |
-| **Top N** | Symbols ranked by Gap% × RVOL score | Keep **{int(scanner_top_n)}** |
-
-Scanner fires at **9:25 AM EST**. Only these tickers receive intraday signals for the rest of the day.
-
-RVOL normalises by minutes (325 vs 390) so premarket-volume rates compare fairly against full-session averages.
-        """)
-    with sc2:
-        st.info(f"""
-**Why scan pre-market?**
-
-Most ORB breakouts with follow-through come from stocks that *already have momentum* before the bell:
-- A large gap (≥ {gap_min_pct:.1f}%) signals a catalyst — earnings, news, upgrade.
-- High RVOL (≥ {rvol_min:.1f}×) shows institutional participation, not retail noise.
-
-Filtering to the top **{int(scanner_top_n)}** keeps the bot focused on the strongest setups.
-        """)
 
     # ── Phase 1 ───────────────────────────────────────────────────────────────
     st.markdown("---")
@@ -2023,7 +1663,7 @@ Low-volume ORBs lead to wide fills and slippage that ruins the theoretical edge.
 
 **Min ATR % ({min_atr_pct:.1f}%)**
 14-day Average True Range as % of price measures "how much does this stock normally move per day."
-A stock with ATR < {min_atr_pct:.1f}% may never even reach TP1 = {tp1_r:.1f}R before EOD flatten.
+A stock with ATR < {min_atr_pct:.1f}% may never even reach TP = {risk_ratio:.2f}R before EOD flatten.
 
 **VWAP accumulation**
 Starts fresh at 9:30 AM every session. A breakout *above VWAP* means the average intraday buyer is in profit and the stock has strong upward bias.
@@ -2043,6 +1683,7 @@ Every 1-minute bar **after 9:{30 + orb_minutes:02d} AM** is tested.
 | **VWAP filter** | Close `>` VWAP | Close `<` VWAP | {"✅ ON" if vwap_filter else "⚠️ OFF"} |
 | **Volume surge** | Bar volume `≥` {volume_surge_mult:.1f}× avg ORB vol | same | Always on |
 | **Spread filter** | Bid-ask ≤ {max_spread_pct:.3f}% of ask | same | Live bot only |
+| **Last entry** | Signal must fire before {last_entry_time} EST | same | Settings bar |
 
 > **One trade per symbol per day.** Once a signal fires the symbol is locked: `SCANNING → SUBMITTING → IN_TRADE`.
 > No second entry is taken even if the first trade closes early.
@@ -2058,71 +1699,57 @@ Wide spreads (e.g. > {max_spread_pct:.3f}%) on low-float names destroy the theor
 
     # ── Phase 3 ───────────────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### Phase 3 · Two-Leg Scale-Out Order Execution")
+    st.markdown("### Phase 3 · Bracket Order Execution")
 
-    # Live example numbers
-    _rng_ex   = 2.50
-    _entry_l  = 100.00
-    _entry_s  = 97.50
-    _risk     = _rng_ex / 2  # midpoint SL
-    _tp1_l    = round(_entry_l + _risk * tp1_r, 2)
-    _tp2_l    = round(_entry_l + _risk * tp2_r, 2)
-    _sl_l     = round(_entry_l - _risk, 2)
-    _tp1_s    = round(_entry_s - _risk * tp1_r, 2)
-    _tp2_s    = round(_entry_s - _risk * tp2_r, 2)
-    _sl_s     = round(_entry_s + _risk, 2)
+    _rng_ex  = 2.50
+    _entry_l = 100.00
+    _entry_s = 97.50
+    _risk    = _rng_ex / 2  # midpoint SL risk_per_share
+    _tp_l    = round(_entry_l + _rng_ex * risk_ratio, 2)   # TP = entry + ORB_range × R
+    _sl_l    = round(_entry_l - _risk, 2)
+    _tp_s    = round(_entry_s - _rng_ex * risk_ratio, 2)   # TP = entry - ORB_range × R
+    _sl_s    = round(_entry_s + _risk, 2)
 
     ex1, ex2 = st.columns(2)
     with ex1:
-        st.markdown("#### 🟢 Long — Scale-Out Levels")
+        st.markdown("#### 🟢 Long — Entry Levels")
         st.markdown(f"""
 ```
 ORB High   = {_entry_l - 0.20:.2f}
+ORB Low    = {_entry_s:.2f}
+ORB Range  = {_rng_ex:.2f}
 Entry      ≈ {_entry_l:.2f}  (close above ORB High)
 SL         = {_sl_l:.2f}  (midpoint of ORB range)
 Risk/share = Entry − SL = {_entry_l - _sl_l:.2f}
 
-Leg 1 — 50% of total qty
-  TP1      = Entry + {tp1_r:.1f}R = {_tp1_l:.2f}
-  → SL moves to break-even ({_entry_l:.2f}) after TP1 fills
+TP = Entry + {risk_ratio:.2f}× ORB_range = {_tp_l:.2f}  (full qty exits here)
 
-Leg 2 — remaining 50%
-  TP2      = Entry + {tp2_r:.1f}R = {_tp2_l:.2f}
-  SL       = break-even ({_entry_l:.2f}) once Leg 1 fills
-  → Leg 2 is risk-free after TP1
-
-Worst case  → both legs stop at {_sl_l:.2f}  (−1R)
-Best case   → Leg1 at {_tp1_l:.2f} (+{tp1_r:.1f}R), Leg2 at {_tp2_l:.2f} (+{tp2_r:.1f}R)
+Worst case → stops at {_sl_l:.2f}
+Best case  → fills at {_tp_l:.2f}
 ```
         """)
     with ex2:
-        st.markdown("#### 🔴 Short — Scale-Out Levels")
+        st.markdown("#### 🔴 Short — Entry Levels")
         st.markdown(f"""
 ```
 ORB Low    = {_entry_s + 0.20:.2f}
+ORB High   = {_entry_l:.2f}
+ORB Range  = {_rng_ex:.2f}
 Entry      ≈ {_entry_s:.2f}  (close below ORB Low)
 SL         = {_sl_s:.2f}  (midpoint of ORB range)
 Risk/share = SL − Entry = {_sl_s - _entry_s:.2f}
 
-Leg 1 — 50% of total qty
-  TP1      = Entry − {tp1_r:.1f}R = {_tp1_s:.2f}
-  → SL moves to break-even ({_entry_s:.2f}) after TP1 fills
+TP = Entry − {risk_ratio:.2f}× ORB_range = {_tp_s:.2f}  (full qty exits here)
 
-Leg 2 — remaining 50%
-  TP2      = Entry − {tp2_r:.1f}R = {_tp2_s:.2f}
-  SL       = break-even ({_entry_s:.2f}) once Leg 1 fills
-  → Leg 2 is risk-free after TP1
-
-Worst case  → both legs stop at {_sl_s:.2f}  (−1R)
-Best case   → Leg1 at {_tp1_s:.2f} (+{tp1_r:.1f}R), Leg2 at {_tp2_s:.2f} (+{tp2_r:.1f}R)
+Worst case → stops at {_sl_s:.2f}
+Best case  → fills at {_tp_s:.2f}
 ```
         """)
 
     st.info("""
-**Implementation detail:** Two bracket orders are submitted simultaneously — one for each leg, each with its own TP and the same initial SL.
-After Leg 1's TP fills, the bot cancels Leg 2's original SL and replaces it with a stop at the entry price (break-even).
-Alpaca's OCO mechanism auto-cancels the paired SL when TP fills, so no orphan orders are left.
-If the bot crashes after both orders are submitted, Alpaca still manages all exits.
+**Implementation detail:** A single bracket order is submitted with a take-profit and stop-loss leg.
+Alpaca's OCO mechanism auto-cancels the SL when TP fills (and vice versa), so no orphan orders are left.
+If the bot crashes after the order is submitted, Alpaca still manages all exits.
     """)
 
     st.markdown("---")
@@ -2130,31 +1757,29 @@ If the bot crashes after both orders are submitted, Alpaca still manages all exi
 
     fig_diag = go.Figure()
 
-    _orb_h  = 100.00
-    _orb_l  = 97.50
-    _orb_m  = (_orb_h + _orb_l) / 2
-    _e      = _orb_h + 0.20
-    _r_diag = _e - _orb_m
-    _t1_d   = round(_e + _r_diag * tp1_r, 2)
-    _t2_d   = round(_e + _r_diag * tp2_r, 2)
-    _sl_d   = round(_orb_m, 2)
+    _orb_h       = 100.00
+    _orb_l       = 97.50
+    _orb_m       = (_orb_h + _orb_l) / 2
+    _e           = _orb_h + 0.20
+    _orb_range_d = _orb_h - _orb_l          # ORB range used for TP (matches bot.py)
+    _tp_d        = round(_e + _orb_range_d * risk_ratio, 2)
+    _sl_d        = round(_orb_m, 2)
 
     fig_diag.add_shape(type="rect", x0=0, x1=1, y0=_orb_l, y1=_orb_h,
                        fillcolor="rgba(255,214,0,0.08)",
                        line=dict(color="rgba(255,214,0,0.5)", width=1))
-    fig_diag.add_shape(type="rect", x0=0, x1=1, y0=_e, y1=_t2_d,
+    fig_diag.add_shape(type="rect", x0=0, x1=1, y0=_e, y1=_tp_d,
                        fillcolor="rgba(0,230,118,0.05)", line=dict(width=0))
     fig_diag.add_shape(type="rect", x0=0, x1=1, y0=_sl_d, y1=_e,
                        fillcolor="rgba(239,83,80,0.05)", line=dict(width=0))
 
     for y, label, color, dash in [
-        (_orb_h, f"ORB High  {_orb_h:.2f}",                  "#FFD700", "dot"),
-        (_orb_l, f"ORB Low   {_orb_l:.2f}",                  "#FFA000", "dot"),
-        (_orb_m, f"ORB Mid   {_orb_m:.2f}",                  "#FFCC44", "dot"),
-        (_t2_d,  f"TP2 ({tp2_r:.1f}R)  {_t2_d:.2f}",         "#00e676", "dash"),
-        (_t1_d,  f"TP1 ({tp1_r:.1f}R)  {_t1_d:.2f}",         "#69f0ae", "dash"),
-        (_e,     f"Entry / Break-even  {_e:.2f}",             "#82b1ff", "solid"),
-        (_sl_d,  f"Initial SL  {_sl_d:.2f}",                  "#ef5350", "dash"),
+        (_orb_h, f"ORB High  {_orb_h:.2f}",              "#FFD700", "dot"),
+        (_orb_l, f"ORB Low   {_orb_l:.2f}",              "#FFA000", "dot"),
+        (_orb_m, f"ORB Mid   {_orb_m:.2f}",              "#FFCC44", "dot"),
+        (_tp_d,  f"TP ({risk_ratio:.2f}R)  {_tp_d:.2f}", "#00e676", "dash"),
+        (_e,     f"Entry  {_e:.2f}",                      "#82b1ff", "solid"),
+        (_sl_d,  f"SL  {_sl_d:.2f}",                      "#ef5350", "dash"),
     ]:
         fig_diag.add_shape(type="line", x0=0, x1=1, y0=y, y1=y,
                            line=dict(color=color, dash=dash, width=1.5))
@@ -2165,11 +1790,8 @@ If the bot crashes after both orders are submitted, Alpaca still manages all exi
                              text=f"▲ LONG entry ~{_e:.2f}", showarrow=True,
                              arrowhead=2, arrowcolor="#82b1ff",
                              font=dict(color="#82b1ff", size=12))
-    fig_diag.add_annotation(x=0.25, y=_t1_d,
-                             text=f"← 50% exits here ({tp1_r:.1f}R) → SL moves to B/E",
-                             showarrow=False, font=dict(color="#69f0ae", size=10))
-    fig_diag.add_annotation(x=0.25, y=_t2_d,
-                             text=f"← remaining 50% exits here ({tp2_r:.1f}R) risk-free",
+    fig_diag.add_annotation(x=0.25, y=_tp_d,
+                             text=f"← full position exits here (+{risk_ratio:.2f}R)",
                              showarrow=False, font=dict(color="#00e676", size=10))
 
     fig_diag.update_layout(
@@ -2191,15 +1813,12 @@ If the bot crashes after both orders are submitted, Alpaca still manages all exi
 ```
 risk_dollar    = account_equity × {risk_pct_equity:.1f}%
 risk_per_share = entry_price − sl_price
-total_qty      = floor(risk_dollar ÷ risk_per_share)   [minimum 2]
-half_qty       = total_qty ÷ 2                          → Leg 1
-remaining_qty  = total_qty − half_qty                   → Leg 2
+total_qty      = floor(risk_dollar ÷ risk_per_share)   [minimum 1]
 ```
 
 Every trade risks the **same dollar amount** regardless of price.
 A high-volatility stock (wide SL) gets fewer shares.
 A tight-range stock gets more shares.
-The minimum of 2 shares ensures two legs can always be opened.
         """)
     with sz2:
         st.markdown(f"#### Sizing examples at {risk_pct_equity:.1f}% risk, $100,000 equity")
@@ -2239,20 +1858,12 @@ SCANNING
     │  First bar that passes price + VWAP + surge + spread filters
     ▼
 SUBMITTING          ← race-condition guard (no double orders)
-    │  Both bracket orders acknowledged by Alpaca
+    │  Bracket order acknowledged by Alpaca
     ▼
-IN_TRADE            ← both legs live
+IN_TRADE            ← bracket order live
     │
-    ├─ Leg 1 TP1 fills
-    │       ▼
-    │   PARTIAL_EXIT → bot cancels original Leg 2 SL
-    │       ▼
-    │   BREAK_EVEN   → new SL placed at entry price for Leg 2
-    │       │
-    │       ├─ Leg 2 TP2 fills  →  COMPLETED (exit: TP2)
-    │       └─ BE stop fills    →  COMPLETED (exit: BE)
-    │
-    ├─ Leg 1 SL fills → both legs stopped out → COMPLETED (exit: SL)
+    ├─ TP fills  →  COMPLETED (exit: TP)
+    ├─ SL fills  →  COMPLETED (exit: SL)
     └─ 3:55 PM flatten → all positions closed → COMPLETED (exit: EOD)
 
 INVALID  ← analyst filter failed (low vol, low ATR, data gap)
@@ -2319,7 +1930,7 @@ Alpaca is commission-free but passes through SEC and FINRA regulatory fees on ev
 | **SEC fee** | $20.60 per $1,000,000 of principal sold | None |
 | **FINRA TAF** | $0.000195 per share sold | $9.79 per transaction |
 
-These are applied in backtest to both the TP1 (Leg 1) exit and the final Leg 2 exit.
+These are applied in backtest to the TP or SL exit.
 The `Total Fees` stat in backtest results reflects the full regulatory cost over all trades.
     """)
 

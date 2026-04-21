@@ -1332,6 +1332,61 @@ class ORBBot:
 
             await self._resync_from_rest()
 
+    async def _seed_ranges_on_startup(self):
+        """
+        After a mid-day restart, seed ORB ranges from orb_ranges table (not price_bars)
+        so a sparse price_bars record (caused by a crash during the ORB window) doesn't
+        block recovery.  Also reconstructs VWAP and avg_orb_volume from price_bars.
+        """
+        now_est = datetime.now(self.config.tz)
+        orb_end = now_est.replace(hour=9, minute=30, second=0, microsecond=0) + timedelta(minutes=self.config.orb_minutes)
+        if now_est <= orb_end:
+            return  # still inside the ORB window — live bars will build the range
+
+        today = now_est.strftime("%Y-%m-%d")
+        for symbol, state in self.states.items():
+            async with state.lock:
+                if state.status != STATUS_WAITING or state.range_high is not None:
+                    continue
+
+            # Read orb_ranges row outside the lock (async I/O)
+            async with aiosqlite.connect(self.config.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                row = await (await db.execute(
+                    "SELECT * FROM orb_ranges WHERE date=? AND symbol=? AND valid=1",
+                    (today, symbol),
+                )).fetchone()
+            if row is None:
+                continue
+
+            # Reconstruct VWAP and avg_orb_volume from price_bars
+            all_bars  = await self.db.fetch_all_bars_today(symbol, today)
+            orb_end_m = 30 + self.config.orb_minutes
+            orb_bars  = await self.db.fetch_orb_bars(symbol, today, orb_end_m)
+
+            async with state.lock:
+                if state.status != STATUS_WAITING:
+                    continue  # another coroutine already set the state
+                state.range_high     = row["range_high"]
+                state.range_low      = row["range_low"]
+                state.range_mid      = row["range_mid"]
+                state.avg_orb_volume = (
+                    sum(float(r["volume"]) for r in orb_bars) / len(orb_bars)
+                    if orb_bars else 0.0
+                )
+                for r in all_bars:
+                    typical = (r["high"] + r["low"] + r["close"]) / 3.0
+                    state.vwap_num += typical * float(r["volume"])
+                    state.vwap_den += float(r["volume"])
+                state.status = STATUS_SCANNING
+
+            logger.info(
+                "%s | Startup: range seeded from DB — H=%.2f L=%.2f AvgVol=%.0f VWAP=%.3f",
+                symbol, row["range_high"], row["range_low"],
+                state.avg_orb_volume,
+                state.vwap_num / state.vwap_den if state.vwap_den > 0 else 0,
+            )
+
     # ── Entry Point ────────────────────────────────────────────────────────────
 
     async def run(self):
@@ -1343,6 +1398,7 @@ class ORBBot:
         await self.db.log_event("START", f"universe={self.config.symbols}")
 
         await self._resume_from_db()
+        await self._seed_ranges_on_startup()
 
         self.stream.subscribe_bars(self.on_bar, *self.config.symbols)
 

@@ -681,27 +681,27 @@ class ORBBot:
         if self.config.vwap_filter and state.vwap_den > 0:
             vwap = state.vwap_num / state.vwap_den
             if signal == "LONG" and close <= vwap:
-                state.status = STATUS_COMPLETED
-                reason = f"BELOW_VWAP (close={close:.2f} ≤ vwap={vwap:.2f})"
-                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
-                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                state.status = STATUS_SCANNING
+                reason = f"BELOW_VWAP (close={close:.2f} ≤ vwap={vwap:.2f}) — retrying"
+                logger.info("%s | FILTER RETRY: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
                 return
             if signal == "SHORT" and close >= vwap:
-                state.status = STATUS_COMPLETED
-                reason = f"ABOVE_VWAP (close={close:.2f} ≥ vwap={vwap:.2f})"
-                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
-                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                state.status = STATUS_SCANNING
+                reason = f"ABOVE_VWAP (close={close:.2f} ≥ vwap={vwap:.2f}) — retrying"
+                logger.info("%s | FILTER RETRY: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
                 return
 
         # ── Volume surge confirmation ──────────────────────────────────────────
         if self.config.volume_surge_mult > 0 and state.avg_orb_volume > 0:
             min_vol = state.avg_orb_volume * self.config.volume_surge_mult
             if float(bar.volume) < min_vol:
-                state.status = STATUS_COMPLETED
+                state.status = STATUS_SCANNING
                 reason = (f"LOW_VOL_SURGE (bar={bar.volume:,} < "
-                           f"{self.config.volume_surge_mult}×avg={state.avg_orb_volume:,.0f})")
-                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
-                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                          f"{self.config.volume_surge_mult}×avg={state.avg_orb_volume:,.0f}) — retrying")
+                logger.info("%s | FILTER RETRY: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
                 return
 
         # ── Spread filter — transient; retry next bar ──────────────────────────

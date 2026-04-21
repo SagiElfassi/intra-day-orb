@@ -1619,9 +1619,9 @@ with tab_rules:
 | Min ORB Volume | ✅ | ✅ | Same threshold from settings bar |
 | Min ATR % (14-day) | ✅ | ✅ | Same threshold from settings bar |
 | Price breakout (close > ORB High / < ORB Low) | ✅ | ✅ | Identical logic |
-| VWAP filter | ✅ | ✅ | Toggle in settings bar controls both |
-| Volume surge filter | ✅ | ✅ | Multiplier in settings bar controls both |
-| Bid-ask spread filter | ✅ Live quotes | ⚠️ Not applied | No historical quote data available |
+| VWAP filter | ✅ retry each bar | ✅ retry each bar | Toggle in settings bar controls both |
+| Volume surge filter | ✅ retry each bar | ✅ retry each bar | Multiplier in settings bar controls both |
+| Bid-ask spread filter | ✅ Live quotes, retry | ⚠️ Not applied | No historical quote data available |
 | Single take-profit (full position) | ✅ | ✅ | TP = entry ± ORB range × R:R ratio |
 | Volatility-adjusted sizing (risk % equity) | ✅ Always | ✅ Always | Fixed-USD mode removed |
 | Auto-flatten 3:55 PM | ✅ | ✅ (simulated) | EOD exit recorded |
@@ -1674,19 +1674,19 @@ Starts fresh at 9:30 AM every session. A breakout *above VWAP* means the average
     st.markdown("### Phase 2 · Breakout Signal + Momentum Confirmation")
 
     st.markdown(f"""
-Every 1-minute bar **after 9:{30 + orb_minutes:02d} AM** is tested.
-**All four gates must be true simultaneously** — any single failure skips that bar.
+Every 1-minute bar **after 9:{30 + orb_minutes:02d} AM** is tested until `{last_entry_time} EST`.
+**All four gates must pass** — a failing bar is skipped and the next bar is retried.
 
-| Gate | LONG | SHORT | Setting |
-|------|------|-------|---------|
-| **Price breakout** | Bar close `>` ORB High | Bar close `<` ORB Low | Always on |
-| **VWAP filter** | Close `>` VWAP | Close `<` VWAP | {"✅ ON" if vwap_filter else "⚠️ OFF"} |
-| **Volume surge** | Bar volume `≥` {volume_surge_mult:.1f}× avg ORB vol | same | Always on |
-| **Spread filter** | Bid-ask ≤ {max_spread_pct:.3f}% of ask | same | Live bot only |
-| **Last entry** | Signal must fire before {last_entry_time} EST | same | Settings bar |
+| Gate | LONG | SHORT | On failure |
+|------|------|-------|------------|
+| **Price breakout** | Bar close `>` ORB High | Bar close `<` ORB Low | skip bar, retry next |
+| **VWAP filter** | Close `>` VWAP | Close `<` VWAP | {"✅ ON" if vwap_filter else "⚠️ OFF"} — retry next bar |
+| **Volume surge** | Bar volume `≥` {volume_surge_mult:.1f}× avg ORB vol | same | retry next bar |
+| **Spread filter** | Bid-ask ≤ {max_spread_pct:.3f}% of ask | same | Live only — retry next bar |
+| **Last entry** | Signal must fire before {last_entry_time} EST | same | day ends, no more entries |
 
-> **One trade per symbol per day.** Once a signal fires the symbol is locked: `SCANNING → SUBMITTING → IN_TRADE`.
-> No second entry is taken even if the first trade closes early.
+> **One trade per symbol per day.** Once an order is submitted the symbol is locked: `SCANNING → SUBMITTING → IN_TRADE`.
+> Momentum filter failures are **retried bar-by-bar** until the last-entry cutoff.
 
 **VWAP Filter** — a close above ORB High but *below* VWAP means the average intraday buyer is still underwater; they will sell into the move, capping the breakout.
 

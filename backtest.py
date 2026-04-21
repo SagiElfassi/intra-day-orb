@@ -347,57 +347,51 @@ class BacktestEngine:
 
             avg_orb_vol = orb_bars["volume"].mean() if not orb_bars.empty else 0.0
 
-            # Step 1: first raw breakout in each direction (no filter masks yet)
-            raw_long_mask  = close_vals > rng_high
-            raw_short_mask = close_vals < rng_low
+            # Scan bars one-by-one — retry on filter failures until window_end (mirrors bot.py)
+            entry_iloc  = None
+            side        = None
+            last_reason = None
 
-            has_raw_long  = raw_long_mask.any()
-            has_raw_short = raw_short_mask.any()
+            for i in range(len(scan_bars)):
+                bar_close  = close_vals[i]
+                bar_vwap   = vwap_vals[i]
+                bar_volume = volume_vals[i]
 
-            if not has_raw_long and not has_raw_short:
+                if bar_close > rng_high:
+                    candidate = "LONG"
+                elif bar_close < rng_low:
+                    candidate = "SHORT"
+                else:
+                    continue
+
+                if vwap_filter:
+                    if candidate == "LONG" and bar_close <= bar_vwap:
+                        last_reason = f"BELOW_VWAP close={bar_close:.2f} ≤ vwap={bar_vwap:.2f}"
+                        continue
+                    if candidate == "SHORT" and bar_close >= bar_vwap:
+                        last_reason = f"ABOVE_VWAP close={bar_close:.2f} ≥ vwap={bar_vwap:.2f}"
+                        continue
+
+                if volume_surge_mult > 0 and avg_orb_vol > 0:
+                    if bar_volume < avg_orb_vol * volume_surge_mult:
+                        last_reason = (f"LOW_VOL_SURGE {bar_volume:,.0f} < "
+                                       f"{volume_surge_mult:.1f}×{avg_orb_vol:,.0f}")
+                        continue
+
+                entry_iloc = i
+                side       = candidate
+                break
+
+            if entry_iloc is None:
                 result.skipped_days.append(SkippedDay(
                     date=date_str, reason="NO_SIGNAL",
-                    detail=f"Price stayed inside ORB [{rng_low:.2f} – {rng_high:.2f}] "
-                           f"all day. Session range: {close_vals.min():.2f} – {close_vals.max():.2f}.",
+                    detail=(
+                        f"All breakout bars failed momentum filters before {trading_window_end_hour:02d}:{trading_window_end_minute:02d}. "
+                        f"Last: {last_reason}" if last_reason else
+                        f"Price stayed inside ORB [{rng_low:.2f} – {rng_high:.2f}] all day."
+                    ),
                 ))
                 continue
-
-            raw_long_iloc  = int(raw_long_mask.argmax())  if has_raw_long  else len(scan_bars)
-            raw_short_iloc = int(raw_short_mask.argmax()) if has_raw_short else len(scan_bars)
-
-            # Step 2: pick the direction whose raw breakout came first
-            if raw_long_iloc <= raw_short_iloc:
-                side, entry_iloc = "LONG", raw_long_iloc
-            else:
-                side, entry_iloc = "SHORT", raw_short_iloc
-
-            # Step 3: check confirmation filters on THAT bar only
-            bar_close  = close_vals[entry_iloc]
-            bar_vwap   = vwap_vals[entry_iloc]
-            bar_volume = volume_vals[entry_iloc]
-
-            if vwap_filter:
-                if side == "LONG" and bar_close <= bar_vwap:
-                    result.skipped_days.append(SkippedDay(
-                        date=date_str, reason="NO_SIGNAL",
-                        detail=f"VWAP filter: LONG close={bar_close:.2f} ≤ vwap={bar_vwap:.2f} on first breakout bar.",
-                    ))
-                    continue
-                if side == "SHORT" and bar_close >= bar_vwap:
-                    result.skipped_days.append(SkippedDay(
-                        date=date_str, reason="NO_SIGNAL",
-                        detail=f"VWAP filter: SHORT close={bar_close:.2f} ≥ vwap={bar_vwap:.2f} on first breakout bar.",
-                    ))
-                    continue
-
-            if volume_surge_mult > 0 and avg_orb_vol > 0:
-                if bar_volume < avg_orb_vol * volume_surge_mult:
-                    result.skipped_days.append(SkippedDay(
-                        date=date_str, reason="NO_SIGNAL",
-                        detail=f"Volume surge: bar vol {bar_volume:,.0f} < "
-                               f"{volume_surge_mult:.1f}×avg_orb {avg_orb_vol:,.0f} on first breakout bar.",
-                    ))
-                    continue
 
             entry_bar  = scan_bars.iloc[entry_iloc]
             # Entry fills at the ORB boundary (stop-limit order), not the breakout bar close

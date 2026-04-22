@@ -178,8 +178,12 @@ class BacktestEngine:
         min_atr_pct: float = 0.0,
         # Position cap (match bot.py max_position_usd)
         max_position_usd: float = 0.0,
+        # Hard leverage cap as % of equity (match bot.py max_leverage_pct)
+        max_leverage_pct: float = 25.0,
         # ATR stop-loss multiplier (match bot.py atr_sl_mult)
         atr_sl_mult: float = 1.5,
+        # Stop-limit offset: limit_price = stop_price ± this fraction (match bot.py)
+        entry_limit_offset_pct: float = 0.002,
         # Time-of-day filter: no new entries after this time (match bot.py)
         trading_window_end_hour: int = 11,
         trading_window_end_minute: int = 0,
@@ -393,11 +397,74 @@ class BacktestEngine:
                 ))
                 continue
 
-            entry_bar  = scan_bars.iloc[entry_iloc]
-            # Entry fills at the ORB boundary (stop-limit order), not the breakout bar close
+            signal_bar = scan_bars.iloc[entry_iloc]
+            signal_ts  = signal_bar["timestamp"]
+
+            # ── Stop-limit entry: executes on the BAR AFTER the signal bar ─────
+            # Bot submits a DAY stop-limit after bar close; fill happens on the
+            # next 1-minute bar, not the signal bar itself (no look-ahead).
             entry_stop  = rng_high if side == "LONG" else rng_low
-            slip        = round(entry_stop * slippage_bps / 10_000, 2)
-            entry_price = round(entry_stop + slip, 2) if side == "LONG" else round(entry_stop - slip, 2)
+            entry_limit = (
+                round(entry_stop * (1 + entry_limit_offset_pct), 2) if side == "LONG"
+                else round(entry_stop * (1 - entry_limit_offset_pct), 2)
+            )
+            slip = round(entry_stop * slippage_bps / 10_000, 2)
+
+            exec_candidates = all_post_orb[all_post_orb["timestamp"] > signal_ts]
+            if exec_candidates.empty:
+                result.skipped_days.append(SkippedDay(
+                    date=date_str, reason="NO_FILL",
+                    detail="Signal fired on last bar — no execution bar available.",
+                ))
+                continue
+
+            exec_bar  = exec_candidates.iloc[0]
+            exec_open = float(exec_bar["open"])
+            exec_high = float(exec_bar["high"])
+            exec_low  = float(exec_bar["low"])
+
+            if side == "LONG":
+                if exec_open > entry_limit:
+                    # Gapped beyond our limit — stop-limit not filled
+                    result.skipped_days.append(SkippedDay(
+                        date=date_str, reason="NO_FILL",
+                        detail=(f"Exec bar opened at {exec_open:.2f} > limit {entry_limit:.2f} "
+                                f"— stop-limit not filled (god-candle protected)."),
+                    ))
+                    continue
+                elif exec_open >= entry_stop:
+                    entry_price = exec_open   # stop already triggered, fills at open
+                elif exec_high >= entry_stop:
+                    entry_price = entry_stop  # pulled back then rallied to stop
+                else:
+                    result.skipped_days.append(SkippedDay(
+                        date=date_str, reason="NO_FILL",
+                        detail=(f"Stop {entry_stop:.2f} not reached during exec bar "
+                                f"(high={exec_high:.2f})."),
+                    ))
+                    continue
+            else:  # SHORT
+                if exec_open < entry_limit:
+                    result.skipped_days.append(SkippedDay(
+                        date=date_str, reason="NO_FILL",
+                        detail=(f"Exec bar opened at {exec_open:.2f} < limit {entry_limit:.2f} "
+                                f"— stop-limit not filled (god-candle protected)."),
+                    ))
+                    continue
+                elif exec_open <= entry_stop:
+                    entry_price = exec_open
+                elif exec_low <= entry_stop:
+                    entry_price = entry_stop
+                else:
+                    result.skipped_days.append(SkippedDay(
+                        date=date_str, reason="NO_FILL",
+                        detail=(f"Stop {entry_stop:.2f} not reached during exec bar "
+                                f"(low={exec_low:.2f})."),
+                    ))
+                    continue
+
+            entry_price = round(entry_price, 2)
+            entry_ts    = exec_bar["timestamp"]
 
             if stop_loss_type == "atr":
                 atr_dollar = _atr_dollar_by_date.get(trade_date, 0.0)
@@ -427,6 +494,11 @@ class BacktestEngine:
                 total_qty   = max(1, math.floor(position_size_usd / entry_price))
             if max_position_usd > 0:
                 total_qty   = min(total_qty, max(1, math.floor(max_position_usd / entry_price)))
+            if max_leverage_pct > 0:
+                max_pos_qty = max(1, math.floor(
+                    starting_equity * max_leverage_pct / 100.0 / entry_price
+                ))
+                total_qty   = min(total_qty, max_pos_qty)
 
             # Target price — bot.py uses ORB range (not risk_per_share) as the R unit
             orb_range_r = rng_high - rng_low
@@ -443,12 +515,11 @@ class BacktestEngine:
                     4,
                 )
 
-            # ── Exit: all post-ORB bars after entry bar (no time-of-day cap) ──────
-            entry_ts    = entry_bar["timestamp"]
+            # ── Exit: bars after the execution bar (no time-of-day cap) ───────────
             after_entry = all_post_orb[all_post_orb["timestamp"] > entry_ts]
 
             if after_entry.empty:
-                eod_close   = float(entry_bar["close"])
+                eod_close   = float(exec_bar["close"])
                 exit_px     = round(eod_close - slip, 2) if side == "LONG" else round(eod_close + slip, 2)
                 exit_reason = "EOD"
                 exit_ts     = entry_ts
@@ -488,7 +559,7 @@ class BacktestEngine:
                 date        = date_str,
                 symbol      = symbol,
                 side        = side,
-                entry_time  = str(entry_bar["timestamp"]),
+                entry_time  = str(exec_bar["timestamp"]),
                 entry_price = entry_price,
                 take_profit = tp_px,
                 stop_loss   = sl,

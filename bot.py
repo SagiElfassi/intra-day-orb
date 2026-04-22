@@ -169,6 +169,9 @@ class Config:
     # Stop-limit entry: limit_price offset from stop_price (fraction, e.g. 0.002 = 0.2%)
     entry_limit_offset_pct: float = 0.002
 
+    # Hard leverage cap: max position value as % of account equity (0 = unlimited)
+    max_leverage_pct: float = 25.0
+
     # Kill-switch + flatten
     max_daily_loss_pct: float = field(default_factory=lambda: float(os.environ.get("MAX_DAILY_LOSS_PCT", "2.0")))
     flatten_hour: int   = 15
@@ -231,6 +234,9 @@ class TickerState:
 
     # ATR (% of price) cached at range-finalization for use in SL calculation
     atr_pct: float = 0.0
+
+    # 1-entry-per-day guardrail: True once an order is successfully submitted
+    has_entered_today: bool = False
 
 
 # ── Database Manager ───────────────────────────────────────────────────────────
@@ -489,6 +495,7 @@ class ORBBot:
                         state.sl_price            = trade.get("stop_loss")
                         state.entry_price         = trade.get("entry_price")
                         state.side                = trade.get("side")
+                        state.has_entered_today   = True
                     logger.info("%s | RESUMED → IN_TRADE (order=%s)", symbol, order_id)
                     await self.db.log_event("RESUMED", f"{symbol}: IN_TRADE order={order_id}")
                     self.active_symbols.add(symbol)
@@ -555,6 +562,7 @@ class ORBBot:
                 state.entry_qty_filled    = 0
                 state.vwap_num            = 0.0
                 state.vwap_den            = 0.0
+                state.has_entered_today   = False
                 state.trade_date          = today
 
             # Block new signals for these terminal/transitional states
@@ -674,44 +682,45 @@ class ORBBot:
         else:
             return
 
-        # Lock-in SUBMITTING immediately — prevents double-entry from rapid bars
-        state.status = STATUS_SUBMITTING
+        # 1-entry-per-day guardrail
+        if state.has_entered_today:
+            state.status = STATUS_COMPLETED
+            return
 
         # ── VWAP confirmation ──────────────────────────────────────────────────
         if self.config.vwap_filter and state.vwap_den > 0:
             vwap = state.vwap_num / state.vwap_den
             if signal == "LONG" and close <= vwap:
-                state.status = STATUS_COMPLETED
-                reason = f"BELOW_VWAP (close={close:.2f} ≤ vwap={vwap:.2f})"
-                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
-                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                reason = f"BELOW_VWAP (close={close:.2f} ≤ vwap={vwap:.2f}) — retrying"
+                logger.info("%s | FILTER RETRY: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
                 return
             if signal == "SHORT" and close >= vwap:
-                state.status = STATUS_COMPLETED
-                reason = f"ABOVE_VWAP (close={close:.2f} ≥ vwap={vwap:.2f})"
-                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
-                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                reason = f"ABOVE_VWAP (close={close:.2f} ≥ vwap={vwap:.2f}) — retrying"
+                logger.info("%s | FILTER RETRY: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
                 return
 
         # ── Volume surge confirmation ──────────────────────────────────────────
         if self.config.volume_surge_mult > 0 and state.avg_orb_volume > 0:
             min_vol = state.avg_orb_volume * self.config.volume_surge_mult
             if float(bar.volume) < min_vol:
-                state.status = STATUS_COMPLETED
                 reason = (f"LOW_VOL_SURGE (bar={bar.volume:,} < "
-                           f"{self.config.volume_surge_mult}×avg={state.avg_orb_volume:,.0f})")
-                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
-                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                          f"{self.config.volume_surge_mult}×avg={state.avg_orb_volume:,.0f}) — retrying")
+                logger.info("%s | FILTER RETRY: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
                 return
 
         # ── Spread filter — transient; retry next bar ──────────────────────────
         spread_pct = await self._fetch_spread_pct(state.symbol)
         if self.config.max_spread_pct > 0 and spread_pct > self.config.max_spread_pct:
-            state.status = STATUS_SCANNING  # retry on next bar
             reason = f"HIGH_SPREAD ({spread_pct:.4f}% > {self.config.max_spread_pct:.3f}%) — will retry"
             logger.warning("%s | FILTER RETRY: %s", state.symbol, reason)
             await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
             return
+
+        # All filters passed — atomically commit to SUBMITTING before any order I/O
+        state.status = STATUS_SUBMITTING
 
         logger.info(
             "%s | BREAKOUT %s — Close=%.2f H=%.2f L=%.2f VWAP=%.2f Vol=%d",
@@ -809,6 +818,12 @@ class ORBBot:
         total_qty   = max(1, math.floor(risk_dollar / risk_per_share))
         if self.config.max_position_usd > 0:
             total_qty = min(total_qty, max(1, math.floor(self.config.max_position_usd / close)))
+        # Hard leverage cap: position value ≤ max_leverage_pct% of equity
+        if self.config.max_leverage_pct > 0:
+            max_pos_qty = max(1, math.floor(
+                self.starting_equity * self.config.max_leverage_pct / 100.0 / entry_stop
+            ))
+            total_qty = min(total_qty, max_pos_qty)
 
         entry_vwap = round(state.vwap_num / state.vwap_den, 4) if state.vwap_den > 0 else 0.0
 
@@ -833,6 +848,7 @@ class ORBBot:
             state.tp_price            = tp
             state.side                = signal
             state.status              = STATUS_IN_TRADE
+            state.has_entered_today   = True
 
             trade_id = await self.db.insert_trade(
                 date=today, symbol=state.symbol, side=signal,
@@ -1165,7 +1181,7 @@ class ORBBot:
             return
 
         # Backfill bars missed during the disconnect gap
-        await self._backfill_missing_bars(loop)
+        await self._sync_historical_data()
 
         for symbol, state in self.states.items():
             async with state.lock:
@@ -1186,47 +1202,57 @@ class ORBBot:
 
         logger.info("Resync complete. Open: %s", list(open_symbols))
 
-    async def _backfill_missing_bars(self, loop):
-        """Fetch bars missed during a WebSocket gap and replay them through on_bar."""
-        now = datetime.now(timezone.utc)
-        # Only backfill during market hours
-        now_est = now.astimezone(self.config.tz)
-        mkt_open  = now_est.replace(hour=9,  minute=30, second=0, microsecond=0)
-        mkt_close = now_est.replace(hour=16, minute=0,  second=0, microsecond=0)
-        if not (mkt_open <= now_est <= mkt_close):
-            return
-        if self._last_bar_time == 0.0:
+    async def _sync_historical_data(self):
+        """Fetch 1-min bars missed since last_bar_time (or 9:30 AM on startup) via REST.
+
+        On startup (last_bar_time == 0): saves bars to DB only so that
+        _seed_ranges_on_startup can reconstruct VWAP/avg_orb_volume from a
+        complete price_bars record.
+        On reconnection (last_bar_time > 0): saves and replays bars through
+        on_bar to advance the state machine through any missed breakout signals.
+        """
+        now_utc = datetime.now(timezone.utc)
+        now_est = now_utc.astimezone(self.config.tz)
+        mkt_open_est  = now_est.replace(hour=9,  minute=30, second=0, microsecond=0)
+        mkt_close_est = now_est.replace(hour=16, minute=0,  second=0, microsecond=0)
+        if not (mkt_open_est <= now_est <= mkt_close_est):
             return
 
-        gap_start = datetime.fromtimestamp(self._last_bar_time, tz=timezone.utc)
-        gap_secs  = (now - gap_start).total_seconds()
-        if gap_secs < 90:   # less than 1.5 min — nothing to backfill
-            return
+        is_startup = self._last_bar_time == 0.0
+        if is_startup:
+            start_utc = mkt_open_est.astimezone(timezone.utc)
+        else:
+            start_utc = datetime.fromtimestamp(self._last_bar_time, tz=timezone.utc)
+            if (now_utc - start_utc).total_seconds() < 90:
+                return
 
-        logger.info("Backfilling %.0fs gap (%s → now) for %s",
-                    gap_secs, gap_start.strftime("%H:%M:%S"), list(self.active_symbols))
+        logger.info(
+            "Syncing historical bars from %s UTC for %s (startup=%s)",
+            start_utc.strftime("%H:%M:%S"), list(self.active_symbols), is_startup,
+        )
+        loop = asyncio.get_running_loop()
         try:
-            from alpaca.data.requests import StockBarsRequest
-            from alpaca.data.timeframe import TimeFrame
             req = StockBarsRequest(
                 symbol_or_symbols=list(self.active_symbols),
                 timeframe=TimeFrame.Minute,
-                start=gap_start,
-                end=now,
+                start=start_utc,
+                end=now_utc,
                 feed=self.config.data_feed,
             )
             bars_resp = await loop.run_in_executor(
                 None, lambda: self.historical_client.get_stock_bars(req)
             )
-            replayed = 0
+            saved = 0
             for sym, bar_list in bars_resp.items():
                 for bar in bar_list:
-                    await self.on_bar(bar)
-                    replayed += 1
-            if replayed:
-                logger.info("Backfilled %d bars across %d symbols", replayed, len(bars_resp))
+                    await self.db.save_bar(bar)
+                    saved += 1
+                    if not is_startup:
+                        await self.on_bar(bar)
+            if saved:
+                logger.info("Synced %d bar(s) across %d symbol(s)", saved, len(bars_resp))
         except Exception as exc:
-            logger.warning("Bar backfill failed: %s", exc)
+            logger.warning("Historical sync failed: %s", exc)
 
     async def _seed_range_from_bars(self, symbol: str, state: "TickerState"):
         """Load today's ORB bars from DB and set state to SCANNING if range is valid."""
@@ -1332,6 +1358,61 @@ class ORBBot:
 
             await self._resync_from_rest()
 
+    async def _seed_ranges_on_startup(self):
+        """
+        After a mid-day restart, seed ORB ranges from orb_ranges table (not price_bars)
+        so a sparse price_bars record (caused by a crash during the ORB window) doesn't
+        block recovery.  Also reconstructs VWAP and avg_orb_volume from price_bars.
+        """
+        now_est = datetime.now(self.config.tz)
+        orb_end = now_est.replace(hour=9, minute=30, second=0, microsecond=0) + timedelta(minutes=self.config.orb_minutes)
+        if now_est <= orb_end:
+            return  # still inside the ORB window — live bars will build the range
+
+        today = now_est.strftime("%Y-%m-%d")
+        for symbol, state in self.states.items():
+            async with state.lock:
+                if state.status != STATUS_WAITING or state.range_high is not None:
+                    continue
+
+            # Read orb_ranges row outside the lock (async I/O)
+            async with aiosqlite.connect(self.config.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                row = await (await db.execute(
+                    "SELECT * FROM orb_ranges WHERE date=? AND symbol=? AND valid=1",
+                    (today, symbol),
+                )).fetchone()
+            if row is None:
+                continue
+
+            # Reconstruct VWAP and avg_orb_volume from price_bars
+            all_bars  = await self.db.fetch_all_bars_today(symbol, today)
+            orb_end_m = 30 + self.config.orb_minutes
+            orb_bars  = await self.db.fetch_orb_bars(symbol, today, orb_end_m)
+
+            async with state.lock:
+                if state.status != STATUS_WAITING:
+                    continue  # another coroutine already set the state
+                state.range_high     = row["range_high"]
+                state.range_low      = row["range_low"]
+                state.range_mid      = row["range_mid"]
+                state.avg_orb_volume = (
+                    sum(float(r["volume"]) for r in orb_bars) / len(orb_bars)
+                    if orb_bars else 0.0
+                )
+                for r in all_bars:
+                    typical = (r["high"] + r["low"] + r["close"]) / 3.0
+                    state.vwap_num += typical * float(r["volume"])
+                    state.vwap_den += float(r["volume"])
+                state.status = STATUS_SCANNING
+
+            logger.info(
+                "%s | Startup: range seeded from DB — H=%.2f L=%.2f AvgVol=%.0f VWAP=%.3f",
+                symbol, row["range_high"], row["range_low"],
+                state.avg_orb_volume,
+                state.vwap_num / state.vwap_den if state.vwap_den > 0 else 0,
+            )
+
     # ── Entry Point ────────────────────────────────────────────────────────────
 
     async def run(self):
@@ -1343,6 +1424,8 @@ class ORBBot:
         await self.db.log_event("START", f"universe={self.config.symbols}")
 
         await self._resume_from_db()
+        await self._sync_historical_data()    # fetch bars from 9:30 AM → DB
+        await self._seed_ranges_on_startup()  # seed ranges + VWAP from complete DB
 
         self.stream.subscribe_bars(self.on_bar, *self.config.symbols)
 

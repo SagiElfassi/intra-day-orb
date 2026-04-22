@@ -210,6 +210,7 @@ class BacktestEngine:
             result.error = "No data returned — check symbol and date range."
             return result
 
+        current_equity = starting_equity  # compounds after each trade
         df["_date"] = df["timestamp"].dt.date
 
         # ── Pre-compute 14-day rolling ATR per trade date ─────────────────────────
@@ -486,9 +487,9 @@ class BacktestEngine:
                 ))
                 continue
 
-            # Sizing: volatility-adjusted (risk % of equity) or fixed USD
+            # Sizing: volatility-adjusted (risk % of current equity) or fixed USD
             if risk_pct_equity > 0:
-                risk_dollar = starting_equity * risk_pct_equity / 100.0
+                risk_dollar = current_equity * risk_pct_equity / 100.0
                 total_qty   = max(1, math.floor(risk_dollar / risk_per_share))
             else:
                 total_qty   = max(1, math.floor(position_size_usd / entry_price))
@@ -496,7 +497,7 @@ class BacktestEngine:
                 total_qty   = min(total_qty, max(1, math.floor(max_position_usd / entry_price)))
             if max_leverage_pct > 0:
                 max_pos_qty = max(1, math.floor(
-                    starting_equity * max_leverage_pct / 100.0 / entry_price
+                    current_equity * max_leverage_pct / 100.0 / entry_price
                 ))
                 total_qty   = min(total_qty, max_pos_qty)
 
@@ -573,6 +574,7 @@ class BacktestEngine:
                 pnl         = pnl,
                 r_multiple  = r_mult,
             ))
+            current_equity += pnl  # compound for next trade's sizing
 
         result.stats        = _compute_stats(result.trades, len(result.skipped_days))
         result.equity_curve = _equity_curve(result.trades)

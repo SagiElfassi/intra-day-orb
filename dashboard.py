@@ -1380,7 +1380,7 @@ with tab_bt:
         bt_start = st.date_input("Start Date", value=date.today() - timedelta(days=90), key="bt_start")
         bt_end   = st.date_input("End Date",   value=date.today() - timedelta(days=1),  key="bt_end")
     with bc3:
-        bt_equity = st.number_input("Starting Equity ($)", 1_000, 10_000_000, 5_000, 1_000, key="bt_equity")
+        bt_equity = st.number_input("Starting Equity ($)", 1_000, 10_000_000, 100_000, 1_000, key="bt_equity")
         st.caption("Filters and targets come from the settings bar above.")
 
     run_btn = st.button("▶  Run Backtest", type="primary")
@@ -1411,6 +1411,7 @@ with tab_bt:
                         min_orb_volume            = min_orb_volume,
                         min_atr_pct               = min_atr_pct,
                         max_position_usd          = float(max_position_usd),
+                        max_leverage_pct          = float(cfg.get("max_leverage_pct", 25.0)),
                         atr_sl_mult               = cfg.get("atr_sl_mult", 1.5),
                         trading_window_end_hour   = _leh,
                         trading_window_end_minute = _lem,

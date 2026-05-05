@@ -166,8 +166,8 @@ class Config:
     # ATR stop-loss multiplier (used when stop_loss_type="atr")
     atr_sl_mult: float = 1.5
 
-    # Stop-limit entry: limit_price offset from stop_price (fraction, e.g. 0.002 = 0.2%)
-    entry_limit_offset_pct: float = 0.002
+    # Stop-limit entry: limit_price offset from stop_price (fraction, e.g. 0.005 = 0.5%)
+    entry_limit_offset_pct: float = 0.005
 
     # Hard leverage cap: max position value as % of account equity (0 = unlimited)
     max_leverage_pct: float = 25.0
@@ -790,10 +790,10 @@ class ORBBot:
         offset = self.config.entry_limit_offset_pct
         if signal == "LONG":
             entry_stop  = round(state.range_high, 2)
-            entry_limit = round(state.range_high * (1 + offset), 2)
+            entry_limit = round(close * (1 + offset), 2)
         else:
             entry_stop  = round(state.range_low, 2)
-            entry_limit = round(state.range_low  * (1 - offset), 2)
+            entry_limit = round(close * (1 - offset), 2)
 
         if self.config.stop_loss_type == "atr" and state.atr_pct > 0:
             atr_dollar = (state.atr_pct / 100.0) * entry_stop
@@ -1132,6 +1132,9 @@ class ORBBot:
                         continue
                     trade_db_id = state.trade_db_id
                     order_ids   = [o for o in (state.order_id,) if o]
+                    entry_price = state.entry_price
+                    side        = state.side
+                    qty_req     = state.entry_qty_requested
 
                 try:
                     try:
@@ -1142,7 +1145,7 @@ class ORBBot:
                     except Exception:
                         pass  # 404 → position gone
 
-                    # Cancel all associated orders
+                    # Cancel any remaining open orders
                     cancelled = 0
                     for oid in order_ids:
                         try:
@@ -1152,6 +1155,35 @@ class ORBBot:
                             cancelled += 1
                         except Exception:
                             pass
+
+                    # When cancelled == 0 the bracket executed cleanly (TP or SL hit).
+                    # Look up the filled leg so we can record the real exit.
+                    db_status    = "CLOSED_MANUAL"
+                    exit_price   = None
+                    realized_pnl = None
+                    if cancelled == 0 and order_ids and entry_price and side and qty_req:
+                        try:
+                            o = await loop.run_in_executor(
+                                None, lambda oid=order_ids[0]: self.trading_client.get_order_by_id(oid)
+                            )
+                            for leg in (o.legs or []):
+                                if str(getattr(leg, "status", "")).lower() != "filled":
+                                    continue
+                                leg_type   = str(getattr(leg, "order_type", "")).lower()
+                                exit_price = round(float(leg.filled_avg_price), 4)
+                                realized_pnl = round(
+                                    (exit_price - entry_price) * qty_req if side == "LONG"
+                                    else (entry_price - exit_price) * qty_req,
+                                    2,
+                                )
+                                db_status = "CLOSED_TP" if "limit" in leg_type else "CLOSED_SL"
+                                logger.info(
+                                    "%s | %s detected by orphan cleanup @ %.4f  pnl=$%.2f",
+                                    symbol, db_status, exit_price, realized_pnl,
+                                )
+                                break
+                        except Exception as exc:
+                            logger.debug("Orphan leg lookup failed %s: %s", symbol, exc)
 
                     logger.warning(
                         "%s | Orphan cleanup: position gone, cancelled %d order(s)",
@@ -1164,10 +1196,21 @@ class ORBBot:
                     async with state.lock:
                         state.status = STATUS_COMPLETED
                         if trade_db_id:
-                            await self.db.update_trade(
-                                trade_db_id, status="CLOSED_MANUAL",
-                                closed_at=datetime.now(timezone.utc).isoformat(),
-                            )
+                            upd = dict(status=db_status,
+                                       closed_at=datetime.now(timezone.utc).isoformat())
+                            if exit_price is not None:
+                                upd["exit_price"] = exit_price
+                            if realized_pnl is not None:
+                                upd["realized_pnl"] = realized_pnl
+                            await self.db.update_trade(trade_db_id, **upd)
+
+                    if db_status in ("CLOSED_TP", "CLOSED_SL"):
+                        await self.db.log_event(
+                            db_status,
+                            f"{symbol} exit={exit_price:.4f} pnl={realized_pnl:.2f}",
+                        )
+                        await self._email_exit(symbol, db_status, exit_price, realized_pnl)
+
                 except Exception as exc:
                     logger.debug("Orphan cleanup error %s: %s", symbol, exc)
 
@@ -1243,7 +1286,7 @@ class ORBBot:
                 None, lambda: self.historical_client.get_stock_bars(req)
             )
             saved = 0
-            for sym, bar_list in bars_resp.items():
+            for sym, bar_list in bars_resp.data.items():
                 for bar in bar_list:
                     await self.db.save_bar(bar)
                     saved += 1

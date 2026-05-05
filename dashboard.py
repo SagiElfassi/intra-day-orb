@@ -150,7 +150,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-st.markdown("""
+st.html("""
 <style>
 /* hide the default sidebar toggle arrow */
 [data-testid="collapsedControl"] { display: none; }
@@ -179,7 +179,7 @@ st.markdown("""
     margin-bottom:12px;
 }
 </style>
-""", unsafe_allow_html=True)
+""")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -620,7 +620,7 @@ def render_trade_card(trade: pd.Series, current_price: float | None):
       {rr_html}
       {pnl_row}
     </div>"""
-    st.markdown(html, unsafe_allow_html=True)
+    st.html(html)
 
 
 # ── Backtest charts ────────────────────────────────────────────────────────────
@@ -920,7 +920,7 @@ def _run_preflight_test(paper: bool, symbols: list):
 
 cfg = load_config()
 
-st.markdown('<div class="settings-bar">', unsafe_allow_html=True)
+st.html('<div class="settings-bar">')
 
 # ── Row 0: account strip ──────────────────────────────────────────────────────
 _acct_c1, _acct_c2, _acct_c3, _acct_c4, _acct_c5, _acct_c6, _acct_c7, _acct_c8, _acct_c9, _acct_c10, _acct_c11 = st.columns([1.2, 1.2, 1.2, 1.2, 1, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9])
@@ -956,10 +956,9 @@ with _acct_c8:
 
 _bot_status_label, _bot_status_color = bot_status()
 with _acct_c9:
-    st.markdown(
+    st.html(
         f'<div style="padding:6px 0 2px;font-size:0.82em;color:{_bot_status_color};font-weight:600">'
-        f'{_bot_status_label}</div>',
-        unsafe_allow_html=True,
+        f'{_bot_status_label}</div>'
     )
     st.caption("Bot status")
 with _acct_c10:
@@ -1149,7 +1148,7 @@ with _r2c6:
         _leh, _lem = 11, 0
         last_entry_time = "11:00"
 
-st.markdown('</div>', unsafe_allow_html=True)
+st.html('</div>')
 
 # Handle save
 if _save_now:

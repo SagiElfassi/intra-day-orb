@@ -114,6 +114,8 @@ class Config:
                 ("min_orb_volume", int),    ("min_atr_pct", float),     ("max_spread_pct", float),
                 ("risk_pct_equity", float), ("max_position_usd", float),("risk_ratio", float),
                 ("volume_surge_mult", float),("vwap_filter", bool),
+                ("min_range_pct", float),   ("max_range_pct", float),
+                ("gap_direction_filter", bool), ("gap_min_pct", float),
             ]
             for attr, cast in scalar_fields:
                 if attr in saved:
@@ -135,7 +137,7 @@ class Config:
     symbols: List[str] = field(
         default_factory=lambda: [
             s.strip().upper()
-            for s in os.environ.get("SYMBOLS", "SPY,QQQ,AAPL,META,TSLA").split(",")
+            for s in os.environ.get("SYMBOLS", "TSLA,NVDA,AMD,META,COIN").split(",")
         ]
     )
 
@@ -168,6 +170,14 @@ class Config:
 
     # Stop-limit entry: limit_price offset from stop_price (fraction, e.g. 0.005 = 0.5%)
     entry_limit_offset_pct: float = 0.005
+
+    # ORB range quality: skip if range is too tight (noise) or too wide (bad R:R). 0 = disabled.
+    min_range_pct: float = 0.0   # min ORB range as % of price
+    max_range_pct: float = 0.0   # max ORB range as % of price
+
+    # Gap direction filter: only take signals aligned with the pre-market gap direction.
+    gap_direction_filter: bool = False
+    gap_min_pct: float = 0.5     # minimum gap % magnitude to activate the filter
 
     # Hard leverage cap: max position value as % of account equity (0 = unlimited)
     max_leverage_pct: float = 25.0
@@ -234,6 +244,9 @@ class TickerState:
 
     # ATR (% of price) cached at range-finalization for use in SL calculation
     atr_pct: float = 0.0
+
+    # Gap % vs yesterday's close (positive = gap-up, negative = gap-down)
+    day_gap_pct: float = 0.0
 
     # 1-entry-per-day guardrail: True once an order is successfully submitted
     has_entered_today: bool = False
@@ -642,8 +655,8 @@ class ORBBot:
             await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
             return
 
-        # ATR filter — also cache for ATR-based stop-loss
-        atr_pct = await self._fetch_atr_pct(state.symbol, state.range_high)
+        # ATR filter — also cache prev_close for gap computation
+        atr_pct, prev_close = await self._fetch_atr_and_prev_close(state.symbol, state.range_high)
         state.atr_pct = atr_pct
         if self.config.min_atr_pct > 0 and atr_pct < self.config.min_atr_pct:
             state.status = STATUS_INVALID
@@ -652,11 +665,30 @@ class ORBBot:
             await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
             return
 
+        # ORB range quality filter
+        range_pct = (state.range_high - state.range_low) / state.range_mid * 100
+        if self.config.min_range_pct > 0 and range_pct < self.config.min_range_pct:
+            state.status = STATUS_INVALID
+            reason = f"TIGHT_RANGE ({range_pct:.2f}% < {self.config.min_range_pct:.1f}%)"
+            logger.warning("%s | FILTER SKIP: %s", state.symbol, reason)
+            await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+            return
+        if self.config.max_range_pct > 0 and range_pct > self.config.max_range_pct:
+            state.status = STATUS_INVALID
+            reason = f"WIDE_RANGE ({range_pct:.2f}% > {self.config.max_range_pct:.1f}%)"
+            logger.warning("%s | FILTER SKIP: %s", state.symbol, reason)
+            await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+            return
+
+        # Gap % vs yesterday's close — used by gap direction filter in _check_breakout
+        if prev_close > 0:
+            state.day_gap_pct = round((state.range_mid - prev_close) / prev_close * 100, 2)
+
         state.status = STATUS_SCANNING
         logger.info(
-            "%s | ORB range SET — H=%.2f L=%.2f Mid=%.2f AvgVol=%.0f (bars=%d)",
+            "%s | ORB range SET — H=%.2f L=%.2f Mid=%.2f AvgVol=%.0f gap=%.1f%% (bars=%d)",
             state.symbol, state.range_high, state.range_low,
-            state.range_mid, state.avg_orb_volume, bars_received,
+            state.range_mid, state.avg_orb_volume, state.day_gap_pct, bars_received,
         )
         await self.db.save_orb_range(
             state.symbol, today,
@@ -686,6 +718,21 @@ class ORBBot:
         if state.has_entered_today:
             state.status = STATUS_COMPLETED
             return
+
+        # ── Gap direction filter — day-level, no retry ────────────────────────
+        if self.config.gap_direction_filter and abs(state.day_gap_pct) >= self.config.gap_min_pct:
+            if signal == "LONG" and state.day_gap_pct < 0:
+                reason = f"AGAINST_GAP (gap={state.day_gap_pct:.1f}% DOWN, signal=LONG)"
+                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                state.status = STATUS_COMPLETED
+                return
+            if signal == "SHORT" and state.day_gap_pct > 0:
+                reason = f"AGAINST_GAP (gap={state.day_gap_pct:.1f}% UP, signal=SHORT)"
+                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                state.status = STATUS_COMPLETED
+                return
 
         # ── VWAP confirmation ──────────────────────────────────────────────────
         if self.config.vwap_filter and state.vwap_den > 0:
@@ -732,7 +779,8 @@ class ORBBot:
 
     # ── Analyst Filters ────────────────────────────────────────────────────────
 
-    async def _fetch_atr_pct(self, symbol: str, ref_price: float) -> float:
+    async def _fetch_atr_and_prev_close(self, symbol: str, ref_price: float) -> tuple:
+        """Returns (atr_pct, prev_close). Either is 0.0 on error."""
         try:
             loop = asyncio.get_running_loop()
             req  = StockBarsRequest(
@@ -745,7 +793,7 @@ class ORBBot:
             resp = await loop.run_in_executor(None, lambda: self.historical_client.get_stock_bars(req))
             bars = resp[symbol]
             if len(bars) < 2:
-                return 0.0
+                return 0.0, 0.0
             trs = [
                 max(
                     float(bars[i].high) - float(bars[i].low),
@@ -754,11 +802,13 @@ class ORBBot:
                 )
                 for i in range(1, len(bars))
             ]
-            atr = sum(trs[-14:]) / min(14, len(trs))
-            return (atr / ref_price) * 100
+            atr        = sum(trs[-14:]) / min(14, len(trs))
+            atr_pct    = (atr / ref_price) * 100
+            prev_close = float(bars[-1].close)
+            return atr_pct, prev_close
         except Exception as exc:
             logger.warning("%s | ATR fetch failed (filter skipped): %s", symbol, exc)
-            return 0.0
+            return 0.0, 0.0
 
     async def _fetch_spread_pct(self, symbol: str) -> float:
         try:
@@ -855,7 +905,7 @@ class ORBBot:
                 qty=total_qty, take_profit=tp, stop_loss=sl,
                 order_id=state.order_id,
                 tp1_price=tp,
-                gap_pct=0.0, rvol=0.0,
+                gap_pct=state.day_gap_pct, rvol=0.0,
                 entry_vwap=entry_vwap,
             )
             state.trade_db_id = trade_id

@@ -204,6 +204,26 @@ class BacktestEngine:
         # ORB range quality: skip ranges too tight (noise) or too wide (bad R:R). 0 = disabled.
         min_range_pct: float = 0.0,
         max_range_pct: float = 0.0,
+        # SPY trend filter
+        spy_filter: bool = False,
+        spy_sma_period: int = 20,
+        # Pullback entry
+        max_chase_pct: float = 0.0,
+        pullback_bars: int = 3,
+        # Earnings/catalyst skip
+        max_gap_abs_pct: float = 0.0,
+        # First 5-min candle filter
+        first_bar_filter: bool = False,
+        # TP taper
+        tp_taper: bool = False,
+        tp_taper_1_hour: int = 10,
+        tp_taper_1_min: int = 15,
+        tp_taper_1_mult: float = 0.75,
+        tp_taper_2_hour: int = 10,
+        tp_taper_2_min: int = 45,
+        tp_taper_2_mult: float = 0.50,
+        # Historical RVOL
+        rvol_mult: float = 0.0,
     ) -> BacktestResult:
 
         result = BacktestResult(
@@ -238,7 +258,7 @@ class BacktestEngine:
             df[df["timestamp"].dt.hour >= 9]
             .groupby("_date")
             .agg(daily_high=("high", "max"), daily_low=("low", "min"),
-                 daily_close=("close", "last"))
+                 daily_close=("close", "last"), daily_volume=("volume", "sum"))
             .reset_index()
             .sort_values("_date")
         )
@@ -259,6 +279,39 @@ class BacktestEngine:
         _atr_by_date        = dict(zip(daily["_date"], daily["atr_pct"]))   # % (for filter)
         _atr_dollar_by_date = dict(zip(daily["_date"], daily["atr14"]))     # $ (for SL calc)
         _prev_close_by_date = dict(zip(daily["_date"], daily["prev_close"].fillna(0.0)))
+
+        # Historical RVOL: 20-day rolling average of daily volume scaled to ORB window
+        daily["hist_orb_vol"] = (
+            daily["daily_volume"].rolling(20, min_periods=1).mean().shift(1)
+            * (orb_minutes / 390.0)
+        ).fillna(0.0)
+        _hist_orb_vol_by_date = dict(zip(daily["_date"], daily["hist_orb_vol"]))
+
+        # ── SPY trend filter: build bias dict per trade date ──────────────────
+        _spy_bias_by_date: dict = {}
+        if spy_filter:
+            try:
+                spy_df = self.fetch_bars("SPY", start_date, end_date, feed=feed)
+                if not spy_df.empty:
+                    spy_daily = (
+                        spy_df[spy_df["timestamp"].dt.hour >= 9]
+                        .groupby(spy_df["timestamp"].dt.date)
+                        .agg(spy_close=("close", "last"))
+                        .reset_index()
+                        .rename(columns={"timestamp": "_date"})
+                        .sort_values("_date")
+                    )
+                    spy_daily["spy_sma"] = (
+                        spy_daily["spy_close"].rolling(spy_sma_period, min_periods=1).mean().shift(1)
+                    )
+                    spy_daily["spy_bias"] = spy_daily.apply(
+                        lambda r: ("LONG" if r["spy_close"] > r["spy_sma"]
+                                   else "SHORT") if pd.notna(r["spy_sma"]) else "NEUTRAL",
+                        axis=1,
+                    )
+                    _spy_bias_by_date = dict(zip(spy_daily["_date"], spy_daily["spy_bias"]))
+            except Exception:
+                pass  # SPY fetch failed — bias stays empty (treated as NEUTRAL)
 
         for trade_date, day_df in df.groupby("_date"):
             day_df   = day_df.sort_values("timestamp").reset_index(drop=True)
@@ -374,6 +427,23 @@ class BacktestEngine:
             if prev_close_val > 0:
                 day_gap_pct = round((rng_mid_val - prev_close_val) / prev_close_val * 100, 2)
 
+            # ── Earnings / large-gap skip ─────────────────────────────────────
+            if max_gap_abs_pct > 0 and abs(day_gap_pct) > max_gap_abs_pct:
+                result.skipped_days.append(SkippedDay(
+                    date=date_str, reason="EARNINGS_GAP",
+                    detail=f"Gap {day_gap_pct:.1f}% exceeds ±{max_gap_abs_pct:.1f}% threshold.",
+                ))
+                continue
+
+            # ── First bar direction bias ──────────────────────────────────────
+            first_bar_bias = ""
+            if not orb_bars.empty:
+                fb = orb_bars.iloc[0]
+                if fb["close"] > fb["open"]:
+                    first_bar_bias = "LONG"
+                elif fb["close"] < fb["open"]:
+                    first_bar_bias = "SHORT"
+
             if all_post_orb.empty or scan_bars.empty:
                 result.skipped_days.append(SkippedDay(
                     date=date_str, reason="NO_SIGNAL",
@@ -419,6 +489,19 @@ class BacktestEngine:
                         last_reason = f"GAP_DIR gap={day_gap_pct:.2f}% (gap-up), SHORT blocked"
                         continue
 
+                # SPY trend filter (day-level — break out of scan loop if blocked)
+                if spy_filter:
+                    spy_bias = _spy_bias_by_date.get(trade_date, "NEUTRAL")
+                    if spy_bias != "NEUTRAL" and candidate != spy_bias:
+                        last_reason = f"SPY_BIAS spy={spy_bias}, signal={candidate} blocked"
+                        break  # day-level filter — no point scanning further bars
+
+                # First bar direction filter (day-level — break out of scan loop)
+                if first_bar_filter and first_bar_bias:
+                    if candidate != first_bar_bias:
+                        last_reason = f"FIRST_BAR_BIAS bar={first_bar_bias}, signal={candidate} blocked"
+                        break  # day-level filter
+
                 if vwap_filter:
                     if candidate == "LONG" and bar_close <= bar_vwap:
                         last_reason = f"BELOW_VWAP close={bar_close:.2f} ≤ vwap={bar_vwap:.2f}"
@@ -431,6 +514,12 @@ class BacktestEngine:
                     if bar_volume < avg_orb_vol * volume_surge_mult:
                         last_reason = (f"LOW_VOL_SURGE {bar_volume:,.0f} < "
                                        f"{volume_surge_mult:.1f}×{avg_orb_vol:,.0f}")
+                        continue
+
+                hist_ov = _hist_orb_vol_by_date.get(trade_date, 0.0)
+                if rvol_mult > 0 and hist_ov > 0:
+                    if bar_volume < hist_ov * rvol_mult:
+                        last_reason = f"LOW_HIST_RVOL {bar_volume:,.0f} < {rvol_mult:.1f}×{hist_ov:,.0f}"
                         continue
 
                 entry_iloc = i
@@ -450,6 +539,35 @@ class BacktestEngine:
 
             signal_bar = scan_bars.iloc[entry_iloc]
             signal_ts  = signal_bar["timestamp"]
+
+            # ── Max-chase / pullback-entry filter ─────────────────────────────
+            if max_chase_pct > 0:
+                boundary  = rng_high if side == "LONG" else rng_low
+                sig_close = float(signal_bar["close"])
+                chase_pct = abs(sig_close - boundary) / boundary * 100
+                if chase_pct > max_chase_pct:
+                    # Scan next pullback_bars bars for a retrace
+                    pb_candidates = all_post_orb[all_post_orb["timestamp"] > signal_ts].head(pullback_bars)
+                    retrace_ts = None
+                    for _, pb_bar in pb_candidates.iterrows():
+                        if side == "LONG":
+                            touch_threshold = boundary * (1 + max_chase_pct / 200)
+                            if float(pb_bar["low"]) <= touch_threshold:
+                                retrace_ts = pb_bar["timestamp"]
+                                break
+                        else:
+                            touch_threshold = boundary * (1 - max_chase_pct / 200)
+                            if float(pb_bar["high"]) >= touch_threshold:
+                                retrace_ts = pb_bar["timestamp"]
+                                break
+                    if retrace_ts is None:
+                        result.skipped_days.append(SkippedDay(
+                            date=date_str, reason="NO_FILL",
+                            detail=(f"Chase {chase_pct:.2f}% > {max_chase_pct:.2f}% and no "
+                                    f"pullback within {pullback_bars} bars."),
+                        ))
+                        continue
+                    signal_ts = retrace_ts
 
             # ── Stop-limit entry: executes on the BAR AFTER the signal bar ─────
             # Bot submits a DAY stop-limit after bar close; fill happens on the
@@ -537,6 +655,19 @@ class BacktestEngine:
                 ))
                 continue
 
+            # ── TP taper: reduce risk_ratio based on signal bar time ──────────
+            sig_h = signal_bar["timestamp"].hour
+            sig_m = signal_bar["timestamp"].minute
+            if tp_taper:
+                if (sig_h, sig_m) >= (tp_taper_2_hour, tp_taper_2_min):
+                    effective_ratio = risk_ratio * tp_taper_2_mult
+                elif (sig_h, sig_m) >= (tp_taper_1_hour, tp_taper_1_min):
+                    effective_ratio = risk_ratio * tp_taper_1_mult
+                else:
+                    effective_ratio = risk_ratio
+            else:
+                effective_ratio = risk_ratio
+
             # Position sizing: risk_pct_equity fraction of equity (matches bot.py lines 867-876)
             if risk_pct_equity > 0:
                 risk_dollar = starting_equity * risk_pct_equity / 100.0
@@ -567,8 +698,8 @@ class BacktestEngine:
                 tp_px = tp2_price
             else:
                 tp_px = (
-                    round(entry_stop + orb_range_r * risk_ratio, 2) if side == "LONG"
-                    else round(entry_stop - orb_range_r * risk_ratio, 2)
+                    round(entry_stop + orb_range_r * effective_ratio, 2) if side == "LONG"
+                    else round(entry_stop - orb_range_r * effective_ratio, 2)
                 )
                 tp1_price = tp2_price = None
 

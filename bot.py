@@ -116,6 +116,12 @@ class Config:
                 ("volume_surge_mult", float),("vwap_filter", bool),
                 ("min_range_pct", float),   ("max_range_pct", float),
                 ("gap_direction_filter", bool), ("gap_min_pct", float),
+                ("spy_filter", bool), ("spy_sma_period", int),
+                ("max_chase_pct", float), ("pullback_bars", int),
+                ("max_gap_abs_pct", float), ("first_bar_filter", bool),
+                ("tp_taper", bool), ("tp_taper_1_hour", int), ("tp_taper_1_min", int),
+                ("tp_taper_1_mult", float), ("tp_taper_2_hour", int), ("tp_taper_2_min", int),
+                ("tp_taper_2_mult", float), ("rvol_mult", float),
             ]
             for attr, cast in scalar_fields:
                 if attr in saved:
@@ -178,6 +184,32 @@ class Config:
     # Gap direction filter: only take signals aligned with the pre-market gap direction.
     gap_direction_filter: bool = False
     gap_min_pct: float = 0.5     # minimum gap % magnitude to activate the filter
+
+    # SPY trend filter: only LONG when SPY > 20-day SMA, only SHORT when below.
+    spy_filter: bool = False
+    spy_sma_period: int = 20
+
+    # Max-chase / pullback-entry filter
+    max_chase_pct: float = 0.0   # 0 = disabled
+    pullback_bars: int = 3
+
+    # Earnings / large-gap skip
+    max_gap_abs_pct: float = 0.0  # 0 = disabled
+
+    # First 5-min candle direction filter
+    first_bar_filter: bool = False
+
+    # Time-of-day TP taper
+    tp_taper: bool = False
+    tp_taper_1_hour: int = 10
+    tp_taper_1_min: int = 15
+    tp_taper_1_mult: float = 0.75
+    tp_taper_2_hour: int = 10
+    tp_taper_2_min: int = 45
+    tp_taper_2_mult: float = 0.50
+
+    # Historical RVOL filter
+    rvol_mult: float = 0.0        # 0 = disabled
 
     # Hard leverage cap: max position value as % of account equity (0 = unlimited)
     max_leverage_pct: float = 25.0
@@ -250,6 +282,17 @@ class TickerState:
 
     # 1-entry-per-day guardrail: True once an order is successfully submitted
     has_entered_today: bool = False
+
+    # First bar direction bias (set in _finalize_range)
+    first_bar_bias: str = ""   # "LONG" | "SHORT" | ""
+
+    # Pullback-entry state
+    awaiting_pullback: bool = False
+    pullback_signal: str = ""
+    pullback_bars_left: int = 0
+
+    # Historical ORB volume (20-day rolling average, set in _finalize_range)
+    hist_orb_vol: float = 0.0
 
 
 # ── Database Manager ───────────────────────────────────────────────────────────
@@ -454,6 +497,7 @@ class ORBBot:
         self.active_symbols: set = set(config.symbols)
 
         self.starting_equity: float = 0.0
+        self.spy_bias: str = "NEUTRAL"   # "LONG" | "SHORT" | "NEUTRAL"
         self.kill_switch_triggered: bool = False
         self._last_bar_time: float = 0.0
         self._stream_reconnect_lock = asyncio.Lock()
@@ -465,6 +509,38 @@ class ORBBot:
         account = await loop.run_in_executor(None, self.trading_client.get_account)
         self.starting_equity = float(account.equity)
         logger.info("Starting equity: $%.2f", self.starting_equity)
+
+    async def _fetch_spy_bias(self):
+        """Fetch SPY daily bars, compute SMA, set self.spy_bias = 'LONG'|'SHORT'|'NEUTRAL'."""
+        if not self.config.spy_filter:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            days_needed = self.config.spy_sma_period * 2  # fetch extra to ensure enough trading days
+            req = StockBarsRequest(
+                symbol_or_symbols="SPY",
+                timeframe=TimeFrame.Day,
+                start=datetime.now(timezone.utc) - timedelta(days=days_needed),
+                end=datetime.now(timezone.utc) - timedelta(days=1),
+                feed=self.config.data_feed,
+            )
+            resp = await loop.run_in_executor(None, lambda: self.historical_client.get_stock_bars(req))
+            bars = resp["SPY"]
+            if len(bars) < self.config.spy_sma_period:
+                logger.warning("SPY filter: not enough bars (%d) — bias=NEUTRAL", len(bars))
+                self.spy_bias = "NEUTRAL"
+                return
+            closes = [float(b.close) for b in bars[-self.config.spy_sma_period:]]
+            sma    = sum(closes) / len(closes)
+            last_close = float(bars[-1].close)
+            self.spy_bias = "LONG" if last_close > sma else "SHORT"
+            logger.info(
+                "SPY bias: %s (close=%.2f vs SMA%d=%.2f)",
+                self.spy_bias, last_close, self.config.spy_sma_period, sma,
+            )
+        except Exception as exc:
+            logger.warning("SPY bias fetch failed — bias=NEUTRAL: %s", exc)
+            self.spy_bias = "NEUTRAL"
 
     # ── Crash Recovery ─────────────────────────────────────────────────────────
 
@@ -576,6 +652,11 @@ class ORBBot:
                 state.vwap_num            = 0.0
                 state.vwap_den            = 0.0
                 state.has_entered_today   = False
+                state.first_bar_bias      = ""
+                state.awaiting_pullback   = False
+                state.pullback_signal     = ""
+                state.pullback_bars_left  = 0
+                state.hist_orb_vol        = 0.0
                 state.trade_date          = today
 
             # Block new signals for these terminal/transitional states
@@ -655,9 +736,10 @@ class ORBBot:
             await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
             return
 
-        # ATR filter — also cache prev_close for gap computation
-        atr_pct, prev_close = await self._fetch_atr_and_prev_close(state.symbol, state.range_high)
-        state.atr_pct = atr_pct
+        # ATR filter — also cache prev_close for gap computation and hist_orb_vol
+        atr_pct, prev_close, hist_orb_vol = await self._fetch_atr_and_prev_close(state.symbol, state.range_high)
+        state.atr_pct     = atr_pct
+        state.hist_orb_vol = hist_orb_vol
         if self.config.min_atr_pct > 0 and atr_pct < self.config.min_atr_pct:
             state.status = STATUS_INVALID
             reason = f"LOW_ATR ({atr_pct:.2f}% < {self.config.min_atr_pct:.1f}%)"
@@ -684,6 +766,22 @@ class ORBBot:
         if prev_close > 0:
             state.day_gap_pct = round((state.range_mid - prev_close) / prev_close * 100, 2)
 
+        # Earnings / large-gap skip
+        if self.config.max_gap_abs_pct > 0 and abs(state.day_gap_pct) > self.config.max_gap_abs_pct:
+            state.status = STATUS_INVALID
+            reason = f"EARNINGS_GAP (gap={state.day_gap_pct:.1f}% > ±{self.config.max_gap_abs_pct:.1f}%)"
+            logger.warning("%s | FILTER SKIP: %s", state.symbol, reason)
+            await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+            return
+
+        # First bar direction bias (for first_bar_filter in _check_breakout)
+        if state.bars:
+            fb = state.bars[0]
+            if fb.close > fb.open:
+                state.first_bar_bias = "LONG"
+            elif fb.close < fb.open:
+                state.first_bar_bias = "SHORT"
+
         state.status = STATUS_SCANNING
         logger.info(
             "%s | ORB range SET — H=%.2f L=%.2f Mid=%.2f AvgVol=%.0f gap=%.1f%% (bars=%d)",
@@ -705,6 +803,33 @@ class ORBBot:
           3. Volume surge — breakout bar must print > volume_surge_mult × avg ORB volume.
           4. Spread filter — bid-ask spread checked live via quote API.
         """
+        # ── Pullback-entry state machine — handled BEFORE normal logic ─────────
+        max_chase_pct = self.config.max_chase_pct
+        if state.awaiting_pullback:
+            state.pullback_bars_left -= 1
+            if state.pullback_signal == "LONG":
+                touch_threshold = state.range_high * (1 + max_chase_pct / 200)
+                if bar.low <= touch_threshold:
+                    state.awaiting_pullback  = False
+                    state.pullback_signal    = ""
+                    state.pullback_bars_left = 0
+                    await self._submit_bracket_order(state, bar, "LONG", today)
+                    return
+            else:  # SHORT
+                touch_threshold = state.range_low * (1 - max_chase_pct / 200)
+                if bar.high >= touch_threshold:
+                    state.awaiting_pullback  = False
+                    state.pullback_signal    = ""
+                    state.pullback_bars_left = 0
+                    await self._submit_bracket_order(state, bar, "SHORT", today)
+                    return
+            if state.pullback_bars_left > 0:
+                return  # still waiting
+            # Timeout — clear flag and fall through to normal breakout logic
+            state.awaiting_pullback  = False
+            state.pullback_signal    = ""
+            state.pullback_bars_left = 0
+
         close = bar.close
 
         if close > state.range_high:
@@ -734,6 +859,24 @@ class ORBBot:
                 state.status = STATUS_COMPLETED
                 return
 
+        # ── SPY trend filter — day-level, no retry ────────────────────────────
+        if self.config.spy_filter and self.spy_bias != "NEUTRAL":
+            if signal != self.spy_bias:
+                reason = f"SPY_BIAS (spy={self.spy_bias}, signal={signal})"
+                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                state.status = STATUS_COMPLETED
+                return
+
+        # ── First bar direction filter — day-level, no retry ─────────────────
+        if self.config.first_bar_filter and state.first_bar_bias:
+            if signal != state.first_bar_bias:
+                reason = f"FIRST_BAR_BIAS (bar={state.first_bar_bias}, signal={signal})"
+                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                state.status = STATUS_COMPLETED
+                return
+
         # ── VWAP confirmation ──────────────────────────────────────────────────
         if self.config.vwap_filter and state.vwap_den > 0:
             vwap = state.vwap_num / state.vwap_den
@@ -758,6 +901,15 @@ class ORBBot:
                 await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
                 return
 
+        # ── Historical RVOL filter — retryable ───────────────────────────────
+        if self.config.rvol_mult > 0 and state.hist_orb_vol > 0:
+            if float(bar.volume) < state.hist_orb_vol * self.config.rvol_mult:
+                reason = (f"LOW_HIST_RVOL (bar={bar.volume:,} < "
+                          f"{self.config.rvol_mult}×hist_avg={state.hist_orb_vol:,.0f}) — retrying")
+                logger.info("%s | FILTER RETRY: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
+                return
+
         # ── Spread filter — transient; retry next bar ──────────────────────────
         spread_pct = await self._fetch_spread_pct(state.symbol)
         if self.config.max_spread_pct > 0 and spread_pct > self.config.max_spread_pct:
@@ -765,6 +917,20 @@ class ORBBot:
             logger.warning("%s | FILTER RETRY: %s", state.symbol, reason)
             await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
             return
+
+        # ── Max-chase / pullback-entry check ──────────────────────────────────
+        if max_chase_pct > 0:
+            boundary = state.range_high if signal == "LONG" else state.range_low
+            chase_pct = abs(close - boundary) / boundary * 100
+            if chase_pct > max_chase_pct:
+                state.awaiting_pullback  = True
+                state.pullback_signal    = signal
+                state.pullback_bars_left = self.config.pullback_bars
+                reason = (f"PULLBACK_WAIT (chase={chase_pct:.2f}% > {max_chase_pct:.2f}%, "
+                          f"waiting {self.config.pullback_bars} bars)")
+                logger.info("%s | %s", state.symbol, reason)
+                await self.db.log_event("PULLBACK_WAIT", f"{state.symbol}: {reason}")
+                return
 
         # All filters passed — atomically commit to SUBMITTING before any order I/O
         state.status = STATUS_SUBMITTING
@@ -780,20 +946,20 @@ class ORBBot:
     # ── Analyst Filters ────────────────────────────────────────────────────────
 
     async def _fetch_atr_and_prev_close(self, symbol: str, ref_price: float) -> tuple:
-        """Returns (atr_pct, prev_close). Either is 0.0 on error."""
+        """Returns (atr_pct, prev_close, hist_orb_vol). Any value is 0.0 on error."""
         try:
             loop = asyncio.get_running_loop()
             req  = StockBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=TimeFrame.Day,
-                start=datetime.now(timezone.utc) - timedelta(days=30),
+                start=datetime.now(timezone.utc) - timedelta(days=40),
                 end=datetime.now(timezone.utc)   - timedelta(days=1),
                 feed=self.config.data_feed,
             )
             resp = await loop.run_in_executor(None, lambda: self.historical_client.get_stock_bars(req))
             bars = resp[symbol]
             if len(bars) < 2:
-                return 0.0, 0.0
+                return 0.0, 0.0, 0.0
             trs = [
                 max(
                     float(bars[i].high) - float(bars[i].low),
@@ -805,10 +971,12 @@ class ORBBot:
             atr        = sum(trs[-14:]) / min(14, len(trs))
             atr_pct    = (atr / ref_price) * 100
             prev_close = float(bars[-1].close)
-            return atr_pct, prev_close
+            avg_daily_vol = sum(float(b.volume) for b in bars[-20:]) / min(20, len(bars))
+            hist_orb_vol  = avg_daily_vol * (self.config.orb_minutes / 390.0)
+            return atr_pct, prev_close, hist_orb_vol
         except Exception as exc:
             logger.warning("%s | ATR fetch failed (filter skipped): %s", symbol, exc)
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
 
     async def _fetch_spread_pct(self, symbol: str) -> float:
         try:
@@ -854,10 +1022,22 @@ class ORBBot:
         else:
             sl = round(state.range_low if signal == "LONG" else state.range_high, 2)
 
-        if signal == "LONG":
-            tp = round(entry_stop + orb_range * self.config.risk_ratio, 2)
+        now_est = datetime.now(self.config.tz)
+        h, m = now_est.hour, now_est.minute
+        if self.config.tp_taper:
+            if (h, m) >= (self.config.tp_taper_2_hour, self.config.tp_taper_2_min):
+                effective_ratio = self.config.risk_ratio * self.config.tp_taper_2_mult
+            elif (h, m) >= (self.config.tp_taper_1_hour, self.config.tp_taper_1_min):
+                effective_ratio = self.config.risk_ratio * self.config.tp_taper_1_mult
+            else:
+                effective_ratio = self.config.risk_ratio
         else:
-            tp = round(entry_stop - orb_range * self.config.risk_ratio, 2)
+            effective_ratio = self.config.risk_ratio
+
+        if signal == "LONG":
+            tp = round(entry_stop + orb_range * effective_ratio, 2)
+        else:
+            tp = round(entry_stop - orb_range * effective_ratio, 2)
 
         risk_per_share = abs(entry_stop - sl)
         if risk_per_share <= 0:
@@ -1514,6 +1694,7 @@ class ORBBot:
 
         await self.db.initialize()
         await self._fetch_starting_equity()
+        await self._fetch_spy_bias()
         await self.db.log_event("START", f"universe={self.config.symbols}")
 
         await self._resume_from_db()

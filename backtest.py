@@ -60,10 +60,12 @@ class BacktestStats:
     losing_trades: int = 0
     win_rate: float = 0.0
     total_pnl: float = 0.0
+    total_return_pct: float = 0.0  # total_pnl / starting_equity × 100
     avg_win: float = 0.0
     avg_loss: float = 0.0
     profit_factor: float = 0.0
     max_drawdown: float = 0.0
+    max_drawdown_pct: float = 0.0  # max_drawdown / starting_equity × 100
     avg_r_multiple: float = 0.0
     best_trade: float = 0.0
     worst_trade: float = 0.0
@@ -94,10 +96,13 @@ class BacktestResult:
     risk_pct_equity: float = 0.0
     tp1_r: float = 0.0
     tp2_r: float = 0.0
+    starting_equity: float = 100_000.0
     trades: List[BacktestTrade] = field(default_factory=list)
     skipped_days: List[SkippedDay] = field(default_factory=list)
     stats: BacktestStats = field(default_factory=BacktestStats)
-    equity_curve: List[float] = field(default_factory=list)
+    equity_curve: List[float] = field(default_factory=list)   # portfolio value per trade, starts at starting_equity
+    spy_equity_curve: List[float] = field(default_factory=list)  # SPY buy-and-hold daily values
+    spy_dates: List[str] = field(default_factory=list)           # dates matching spy_equity_curve
     error: Optional[str] = None
 
 
@@ -237,6 +242,7 @@ class BacktestEngine:
             risk_pct_equity=risk_pct_equity,
             tp1_r=tp1_r,
             tp2_r=tp2_r,
+            starting_equity=starting_equity,
         )
 
         try:
@@ -287,31 +293,45 @@ class BacktestEngine:
         ).fillna(0.0)
         _hist_orb_vol_by_date = dict(zip(daily["_date"], daily["hist_orb_vol"]))
 
-        # ── SPY trend filter: build bias dict per trade date ──────────────────
+        # ── SPY baseline: fetch once for both the trend filter and buy-and-hold comparison ──
         _spy_bias_by_date: dict = {}
-        if spy_filter:
-            try:
-                spy_df = self.fetch_bars("SPY", start_date, end_date, feed=feed)
-                if not spy_df.empty:
-                    spy_daily = (
-                        spy_df[spy_df["timestamp"].dt.hour >= 9]
-                        .groupby(spy_df["timestamp"].dt.date)
-                        .agg(spy_close=("close", "last"))
-                        .reset_index()
-                        .rename(columns={"timestamp": "_date"})
-                        .sort_values("_date")
-                    )
-                    spy_daily["spy_sma"] = (
-                        spy_daily["spy_close"].rolling(spy_sma_period, min_periods=1).mean().shift(1)
-                    )
-                    spy_daily["spy_bias"] = spy_daily.apply(
-                        lambda r: ("LONG" if r["spy_close"] > r["spy_sma"]
-                                   else "SHORT") if pd.notna(r["spy_sma"]) else "NEUTRAL",
-                        axis=1,
-                    )
-                    _spy_bias_by_date = dict(zip(spy_daily["_date"], spy_daily["spy_bias"]))
-            except Exception:
-                pass  # SPY fetch failed — bias stays empty (treated as NEUTRAL)
+        _spy_equity_curve: List[float] = []
+        _spy_dates: List[str] = []
+        try:
+            spy_raw = df if symbol.upper() == "SPY" else self.fetch_bars("SPY", start_date, end_date, feed=feed)
+            if not spy_raw.empty:
+                spy_daily = (
+                    spy_raw[spy_raw["timestamp"].dt.hour >= 9]
+                    .groupby(spy_raw["timestamp"].dt.date)
+                    .agg(spy_close=("close", "last"))
+                    .reset_index()
+                    .rename(columns={"timestamp": "_date"})
+                    .sort_values("_date")
+                )
+                if not spy_daily.empty:
+                    # Buy-and-hold baseline: invest starting_equity on the first day's close
+                    spy_first = float(spy_daily["spy_close"].iloc[0])
+                    _spy_equity_curve = [
+                        round(starting_equity * float(r["spy_close"]) / spy_first, 2)
+                        for _, r in spy_daily.iterrows()
+                    ]
+                    _spy_dates = [str(d) for d in spy_daily["_date"]]
+
+                    if spy_filter:
+                        spy_daily["spy_sma"] = (
+                            spy_daily["spy_close"].rolling(spy_sma_period, min_periods=1).mean().shift(1)
+                        )
+                        spy_daily["spy_bias"] = spy_daily.apply(
+                            lambda r: ("LONG" if r["spy_close"] > r["spy_sma"]
+                                       else "SHORT") if pd.notna(r["spy_sma"]) else "NEUTRAL",
+                            axis=1,
+                        )
+                        _spy_bias_by_date = dict(zip(spy_daily["_date"], spy_daily["spy_bias"]))
+        except Exception:
+            pass  # SPY fetch failed — baseline empty, bias treated as NEUTRAL
+
+        # Running equity — compounds after each closed trade so position sizing grows with the account
+        current_equity = starting_equity
 
         for trade_date, day_df in df.groupby("_date"):
             day_df   = day_df.sort_values("timestamp").reset_index(drop=True)
@@ -668,19 +688,20 @@ class BacktestEngine:
             else:
                 effective_ratio = risk_ratio
 
-            # Position sizing: risk_pct_equity fraction of equity (matches bot.py lines 867-876)
+            # Position sizing: compounds with current_equity (starts at starting_equity,
+            # grows/shrinks after each closed trade — matches real account behaviour)
             if risk_pct_equity > 0:
-                risk_dollar = starting_equity * risk_pct_equity / 100.0
+                risk_dollar = current_equity * risk_pct_equity / 100.0
                 total_qty   = max(1, math.floor(risk_dollar / risk_per_share))
             elif position_size_usd > 0:
                 total_qty = max(1, math.floor(position_size_usd / entry_price))
             else:
-                total_qty = max(1, math.floor(starting_equity / entry_price))
+                total_qty = max(1, math.floor(current_equity / entry_price))
             if max_position_usd > 0:
                 total_qty = min(total_qty, max(1, math.floor(max_position_usd / entry_price)))
             if max_leverage_pct > 0:
                 max_pos_qty = max(1, math.floor(
-                    starting_equity * max_leverage_pct / 100.0 / entry_price
+                    current_equity * max_leverage_pct / 100.0 / entry_price
                 ))
                 total_qty = min(total_qty, max_pos_qty)
 
@@ -915,15 +936,22 @@ class BacktestEngine:
                     r_multiple  = r_mult,
                     gap_pct     = day_gap_pct,
                 ))
+            current_equity = round(current_equity + pnl, 2)
 
-        result.stats        = _compute_stats(result.trades, len(result.skipped_days))
-        result.equity_curve = _equity_curve(result.trades)
+        result.stats           = _compute_stats(result.trades, len(result.skipped_days), starting_equity)
+        result.equity_curve    = _equity_curve(result.trades, starting_equity)
+        result.spy_equity_curve = _spy_equity_curve
+        result.spy_dates        = _spy_dates
         return result
 
 
 # ── Statistics ─────────────────────────────────────────────────────────────────
 
-def _compute_stats(trades: List[BacktestTrade], days_skipped: int = 0) -> BacktestStats:
+def _compute_stats(
+    trades: List[BacktestTrade],
+    days_skipped: int = 0,
+    starting_equity: float = 100_000.0,
+) -> BacktestStats:
     if not trades:
         return BacktestStats(days_skipped_no_data=days_skipped)
 
@@ -943,15 +971,16 @@ def _compute_stats(trades: List[BacktestTrade], days_skipped: int = 0) -> Backte
         if dd > max_dd:
             max_dd = dd
 
+    total_pnl    = sum(pnls)
     win_pct      = len(wins)   / len(trades)
     loss_pct     = len(losses) / len(trades)
     avg_win_val  = sum(wins)   / len(wins)   if wins   else 0.0
     avg_loss_val = sum(losses) / len(losses) if losses else 0.0
 
     expectancy      = round(win_pct * avg_win_val + loss_pct * avg_loss_val, 2)
-    recovery_factor = round(sum(pnls) / max_dd, 2) if max_dd > 0 else float("inf")
+    recovery_factor = round(total_pnl / max_dd, 2) if max_dd > 0 else float("inf")
     sharpe          = round(
-        (sum(pnls) / len(pnls)) / statistics.stdev(pnls), 2
+        (total_pnl / len(pnls)) / statistics.stdev(pnls), 2
     ) if len(pnls) >= 2 and statistics.stdev(pnls) > 0 else 0.0
 
     return BacktestStats(
@@ -959,11 +988,13 @@ def _compute_stats(trades: List[BacktestTrade], days_skipped: int = 0) -> Backte
         winning_trades       = len(wins),
         losing_trades        = len(losses),
         win_rate             = round(win_pct * 100, 1),
-        total_pnl            = round(sum(pnls), 2),
+        total_pnl            = round(total_pnl, 2),
+        total_return_pct     = round(total_pnl / starting_equity * 100, 2) if starting_equity else 0.0,
         avg_win              = round(avg_win_val,  2),
         avg_loss             = round(avg_loss_val, 2),
         profit_factor        = round(gross_profit / gross_loss, 2) if gross_loss else float("inf"),
         max_drawdown         = round(max_dd, 2),
+        max_drawdown_pct     = round(max_dd / starting_equity * 100, 2) if starting_equity else 0.0,
         avg_r_multiple       = round(sum(t.r_multiple for t in trades) / len(trades), 2),
         best_trade           = round(max(pnls), 2),
         worst_trade          = round(min(pnls), 2),
@@ -976,8 +1007,9 @@ def _compute_stats(trades: List[BacktestTrade], days_skipped: int = 0) -> Backte
     )
 
 
-def _equity_curve(trades: List[BacktestTrade]) -> List[float]:
-    curve, equity = [], 0.0
+def _equity_curve(trades: List[BacktestTrade], starting_equity: float = 100_000.0) -> List[float]:
+    curve  = [round(starting_equity, 2)]  # anchor: same starting point as SPY baseline
+    equity = starting_equity
     for t in trades:
         equity += t.pnl
         curve.append(round(equity, 2))

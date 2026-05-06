@@ -628,6 +628,11 @@ def render_trade_card(trade: pd.Series, current_price: float | None):
 def build_equity_curve(
     trades_df: pd.DataFrame,
     benchmark_df: pd.DataFrame | None = None,
+    mode: str = "pnl",                    # "pnl" = dollar P&L | "pct" = % return
+    starting_equity: float = 100_000.0,
+    equity_curve: list | None = None,      # pre-built from BacktestResult
+    spy_equity_curve: list | None = None,  # daily SPY portfolio values
+    spy_dates: list | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     if trades_df.empty:
@@ -637,37 +642,75 @@ def build_equity_curve(
         fig.update_layout(height=300)
         return fig
 
-    x = list(range(1, len(trades_df) + 1))
-    y = trades_df["pnl"].cumsum().tolist()
+    n = len(trades_df)
+    x = list(range(0, n + 1))   # x=0 is starting point, x=1..N are trades
+
+    # ── ORB curve: portfolio value at each trade exit ────────────────────────
+    if equity_curve and len(equity_curve) == n + 1:
+        orb_abs = list(equity_curve)   # already starts at starting_equity
+    else:
+        orb_abs = [starting_equity] + [starting_equity + v
+                   for v in trades_df["pnl"].cumsum().tolist()]
+
+    if mode == "pct":
+        orb_y   = [round((v / starting_equity - 1) * 100, 4) for v in orb_abs]
+        y_label = "Return (%)"
+        h_orb   = "Trade %{x}<br>ORB: %{y:.2f}%<extra></extra>"
+        h_spy   = "Trade %{x}<br>SPY B&H: %{y:.2f}%<extra></extra>"
+        zero_y  = 0.0
+    else:
+        orb_y   = [v - starting_equity for v in orb_abs]   # cumulative dollar P&L from 0
+        y_label = "Cumulative P&L ($)"
+        h_orb   = "Trade %{x}<br>ORB: $%{y:,.2f}<extra></extra>"
+        h_spy   = "Trade %{x}<br>SPY B&H: $%{y:,.2f}<extra></extra>"
+        zero_y  = 0.0
 
     fig.add_trace(go.Scatter(
-        x=x, y=y, mode="lines+markers",
+        x=x, y=orb_y, mode="lines+markers",
         line=dict(color="#82b1ff", width=2),
-        fill="tozeroy",
-        fillcolor="rgba(130,177,255,0.1)",
+        fill="tozeroy", fillcolor="rgba(130,177,255,0.1)",
         name="ORB Strategy",
-        hovertemplate="Trade %{x}<br>ORB: $%{y:.2f}<extra></extra>",
+        hovertemplate=h_orb,
     ))
 
-    if benchmark_df is not None and not benchmark_df.empty:
-        bench_by_date = dict(zip(benchmark_df["date"], benchmark_df["benchmark_pnl"]))
-        sorted_dates  = sorted(bench_by_date.keys())
-        bench_y = []
+    # ── SPY baseline: prefer pre-built curve, fall back to benchmark_df ──────
+    spy_abs_by_date: dict = {}
+    if spy_equity_curve and spy_dates:
+        spy_abs_by_date = dict(zip(spy_dates, spy_equity_curve))
+    elif benchmark_df is not None and not benchmark_df.empty:
+        # legacy benchmark_df stores cumulative P&L, convert back to abs value
+        spy_abs_by_date = {
+            str(row["date"]): starting_equity + row["benchmark_pnl"]
+            for _, row in benchmark_df.iterrows()
+        }
+
+    if spy_abs_by_date:
+        sorted_spy = sorted(spy_abs_by_date.keys())
+        spy_abs = [starting_equity]   # x=0 starting value
         for td in trades_df["date"].tolist():
-            td_str = str(td)
-            candidates = [d for d in sorted_dates if d <= td_str]
-            bench_y.append(bench_by_date[candidates[-1]] if candidates else None)
+            td_str     = str(td)
+            candidates = [d for d in sorted_spy if d <= td_str]
+            spy_abs.append(spy_abs_by_date[candidates[-1]] if candidates else starting_equity)
+
+        spy_y = (
+            [round((v / starting_equity - 1) * 100, 4) for v in spy_abs]
+            if mode == "pct" else
+            [v - starting_equity for v in spy_abs]
+        )
         fig.add_trace(go.Scatter(
-            x=x, y=bench_y,
-            mode="lines",
+            x=x, y=spy_y, mode="lines",
             line=dict(color="#FFD700", width=1.5, dash="dot"),
             name="SPY Buy & Hold",
-            hovertemplate="Trade %{x}<br>SPY B&H: $%{y:.2f}<extra></extra>",
+            hovertemplate=h_spy,
         ))
 
+    # Zero reference line
+    fig.add_hline(y=zero_y, line_color="#546e7a", line_width=1, line_dash="solid")
+
+    title = "Equity Curve vs SPY Buy & Hold" + (" — % Return" if mode == "pct" else " — $ P&L")
     fig.update_layout(
-        title="Equity Curve vs SPY Buy & Hold", height=300,
-        xaxis_title="Trade #", yaxis_title="Cumulative P&L ($)",
+        title=title, height=320,
+        xaxis_title="Trade #", yaxis_title=y_label,
         margin=dict(l=0, r=0, t=40, b=0),
         legend=dict(orientation="h", y=1.15, x=0),
     )
@@ -1437,12 +1480,15 @@ with tab_bt:
             f"|  {result.start_date} → {result.end_date}"
         )
 
+        _ret_pct = getattr(s, "total_return_pct", 0.0)
+        _dd_pct  = getattr(s, "max_drawdown_pct",  0.0)
+
         s1, s2, s3, s4, s5, s6 = st.columns(6)
         s1.metric("Total Trades",   s.total_trades)
         s2.metric("Win Rate",       f"{s.win_rate}%")
-        s3.metric("Total PnL",      f"${s.total_pnl:+.2f}")
+        s3.metric("Total PnL",      f"${s.total_pnl:+,.2f}", delta=f"{_ret_pct:+.2f}%")
         s4.metric("Profit Factor",  f"{s.profit_factor:.2f}" if s.profit_factor != float("inf") else "∞")
-        s5.metric("Max Drawdown",   f"-${s.max_drawdown:.2f}")
+        s5.metric("Max Drawdown",   f"-${s.max_drawdown:,.2f}", delta=f"-{_dd_pct:.2f}%", delta_color="inverse")
         s6.metric("Avg R",          f"{s.avg_r_multiple:.2f}R")
 
         sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
@@ -1465,11 +1511,29 @@ with tab_bt:
             for t in trades_list
         ])
 
-        benchmark_df = st.session_state.get("bt_benchmark")
+        benchmark_df   = st.session_state.get("bt_benchmark")
+        _eq_start      = getattr(result, "starting_equity",    100_000.0)
+        _eq_curve      = getattr(result, "equity_curve",       [])
+        _spy_eq_curve  = getattr(result, "spy_equity_curve",   [])
+        _spy_dates     = getattr(result, "spy_dates",          [])
 
         ch1, ch2 = st.columns([2, 1])
         with ch1:
-            st.plotly_chart(build_equity_curve(trades_df_bt, benchmark_df), use_container_width=True)
+            chart_mode = st.selectbox(
+                "Chart view", ["$ P&L", "% Return"],
+                key="bt_chart_mode", label_visibility="collapsed",
+            )
+            st.plotly_chart(
+                build_equity_curve(
+                    trades_df_bt, benchmark_df,
+                    mode            = "pct" if chart_mode == "% Return" else "pnl",
+                    starting_equity = _eq_start,
+                    equity_curve    = _eq_curve,
+                    spy_equity_curve= _spy_eq_curve,
+                    spy_dates       = _spy_dates,
+                ),
+                use_container_width=True,
+            )
         with ch2:
             st.plotly_chart(build_r_distribution(trades_df_bt), use_container_width=True)
 

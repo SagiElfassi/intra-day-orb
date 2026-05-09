@@ -45,6 +45,12 @@ class BacktestTrade:
     fees: float         # SEC + FINRA TAF regulatory fees
     pnl: float          # net of fees
     r_multiple: float   # net R = pnl / (risk_per_share × total_qty)
+    # Two-leg scale-out fields (None in single-leg mode)
+    tp1_price: Optional[float] = None
+    tp2_price: Optional[float] = None
+    leg1_exit_reason: Optional[str] = None
+    leg1_pnl: Optional[float] = None
+    gap_pct: float = 0.0
 
 
 @dataclass
@@ -54,10 +60,12 @@ class BacktestStats:
     losing_trades: int = 0
     win_rate: float = 0.0
     total_pnl: float = 0.0
+    total_return_pct: float = 0.0  # total_pnl / starting_equity × 100
     avg_win: float = 0.0
     avg_loss: float = 0.0
     profit_factor: float = 0.0
     max_drawdown: float = 0.0
+    max_drawdown_pct: float = 0.0  # max_drawdown / starting_equity × 100
     avg_r_multiple: float = 0.0
     best_trade: float = 0.0
     worst_trade: float = 0.0
@@ -86,10 +94,15 @@ class BacktestResult:
     stop_loss_type: str
     position_size_usd: float
     risk_pct_equity: float = 0.0
+    tp1_r: float = 0.0
+    tp2_r: float = 0.0
+    starting_equity: float = 100_000.0
     trades: List[BacktestTrade] = field(default_factory=list)
     skipped_days: List[SkippedDay] = field(default_factory=list)
     stats: BacktestStats = field(default_factory=BacktestStats)
-    equity_curve: List[float] = field(default_factory=list)
+    equity_curve: List[float] = field(default_factory=list)   # portfolio value per trade, starts at starting_equity
+    spy_equity_curve: List[float] = field(default_factory=list)  # SPY buy-and-hold daily values
+    spy_dates: List[str] = field(default_factory=list)           # dates matching spy_equity_curve
     error: Optional[str] = None
 
 
@@ -183,10 +196,45 @@ class BacktestEngine:
         # ATR stop-loss multiplier (match bot.py atr_sl_mult)
         atr_sl_mult: float = 1.5,
         # Stop-limit offset: limit_price = stop_price ± this fraction (match bot.py)
-        entry_limit_offset_pct: float = 0.002,
+        entry_limit_offset_pct: float = 0.005,
         # Time-of-day filter: no new entries after this time (match bot.py)
         trading_window_end_hour: int = 11,
         trading_window_end_minute: int = 0,
+        # Two-leg scale-out: tp1_r exits half at 1R, tp2_r exits remainder at 3R (0 = disabled)
+        tp1_r: float = 0.0,
+        tp2_r: float = 0.0,
+        # Gap direction filter: skip signals against the pre-market gap direction
+        gap_direction_filter: bool = False,
+        gap_min_pct: float = 0.5,
+        # ORB range quality: skip ranges too tight (noise) or too wide (bad R:R). 0 = disabled.
+        min_range_pct: float = 0.0,
+        max_range_pct: float = 0.0,
+        # SPY trend filter
+        spy_filter: bool = False,
+        spy_sma_period: int = 20,
+        # Pullback entry
+        max_chase_pct: float = 0.0,
+        pullback_bars: int = 3,
+        # Earnings/catalyst skip
+        max_gap_abs_pct: float = 0.0,
+        # First 5-min candle filter
+        first_bar_filter: bool = False,
+        # TP taper
+        tp_taper: bool = False,
+        tp_taper_1_hour: int = 10,
+        tp_taper_1_min: int = 15,
+        tp_taper_1_mult: float = 0.75,
+        tp_taper_2_hour: int = 10,
+        tp_taper_2_min: int = 45,
+        tp_taper_2_mult: float = 0.50,
+        # Historical RVOL
+        rvol_mult: float = 0.0,
+        # Signal quality: close must extend X% beyond ORB boundary (0 = disabled)
+        min_breakout_strength_pct: float = 0.0,
+        # Bar quality: close must be in top/bottom X fraction of bar's own range (0 = disabled)
+        min_bar_close_ratio: float = 0.0,
+        # Exit when price closes back inside ORB after entry (false-breakout cut)
+        failed_breakout_exit: bool = False,
     ) -> BacktestResult:
 
         result = BacktestResult(
@@ -198,6 +246,9 @@ class BacktestEngine:
             stop_loss_type=stop_loss_type,
             position_size_usd=position_size_usd,
             risk_pct_equity=risk_pct_equity,
+            tp1_r=tp1_r,
+            tp2_r=tp2_r,
+            starting_equity=starting_equity,
         )
 
         try:
@@ -219,7 +270,7 @@ class BacktestEngine:
             df[df["timestamp"].dt.hour >= 9]
             .groupby("_date")
             .agg(daily_high=("high", "max"), daily_low=("low", "min"),
-                 daily_close=("close", "last"))
+                 daily_close=("close", "last"), daily_volume=("volume", "sum"))
             .reset_index()
             .sort_values("_date")
         )
@@ -239,6 +290,58 @@ class BacktestEngine:
         daily["atr_pct"] = (daily["atr14"] / daily["daily_close"] * 100).fillna(0.0)
         _atr_by_date        = dict(zip(daily["_date"], daily["atr_pct"]))   # % (for filter)
         _atr_dollar_by_date = dict(zip(daily["_date"], daily["atr14"]))     # $ (for SL calc)
+        _prev_close_by_date = dict(zip(daily["_date"], daily["prev_close"].fillna(0.0)))
+
+        # Historical RVOL: 20-day rolling average of daily volume scaled to ORB window.
+        # Multiply by 3.5 to match bot.py (orb_volume_factor) — the opening period has
+        # ~3.5× per-minute volume vs the rest of the session.
+        _ORB_VOLUME_FACTOR = 3.5
+        daily["hist_orb_vol"] = (
+            daily["daily_volume"].rolling(20, min_periods=1).mean().shift(1)
+            * (orb_minutes / 390.0)
+            * _ORB_VOLUME_FACTOR
+        ).fillna(0.0)
+        _hist_orb_vol_by_date = dict(zip(daily["_date"], daily["hist_orb_vol"]))
+
+        # ── SPY baseline: fetch once for both the trend filter and buy-and-hold comparison ──
+        _spy_bias_by_date: dict = {}
+        _spy_equity_curve: List[float] = []
+        _spy_dates: List[str] = []
+        try:
+            spy_raw = df if symbol.upper() == "SPY" else self.fetch_bars("SPY", start_date, end_date, feed=feed)
+            if not spy_raw.empty:
+                spy_daily = (
+                    spy_raw[spy_raw["timestamp"].dt.hour >= 9]
+                    .groupby(spy_raw["timestamp"].dt.date)
+                    .agg(spy_close=("close", "last"))
+                    .reset_index()
+                    .rename(columns={"timestamp": "_date"})
+                    .sort_values("_date")
+                )
+                if not spy_daily.empty:
+                    # Buy-and-hold baseline: invest starting_equity on the first day's close
+                    spy_first = float(spy_daily["spy_close"].iloc[0])
+                    _spy_equity_curve = [
+                        round(starting_equity * float(r["spy_close"]) / spy_first, 2)
+                        for _, r in spy_daily.iterrows()
+                    ]
+                    _spy_dates = [str(d) for d in spy_daily["_date"]]
+
+                    if spy_filter:
+                        spy_daily["spy_sma"] = (
+                            spy_daily["spy_close"].rolling(spy_sma_period, min_periods=1).mean().shift(1)
+                        )
+                        spy_daily["spy_bias"] = spy_daily.apply(
+                            lambda r: ("LONG" if r["spy_close"] > r["spy_sma"]
+                                       else "SHORT") if pd.notna(r["spy_sma"]) else "NEUTRAL",
+                            axis=1,
+                        )
+                        _spy_bias_by_date = dict(zip(spy_daily["_date"], spy_daily["spy_bias"]))
+        except Exception:
+            pass  # SPY fetch failed — baseline empty, bias treated as NEUTRAL
+
+        # Running equity — compounds after each closed trade so position sizing grows with the account
+        current_equity = starting_equity
 
         for trade_date, day_df in df.groupby("_date"):
             day_df   = day_df.sort_values("timestamp").reset_index(drop=True)
@@ -331,6 +434,49 @@ class BacktestEngine:
                     ))
                     continue
 
+            # ── ORB range quality filter ──────────────────────────────────────
+            rng_mid_val = (rng_high + rng_low) / 2
+            if rng_mid_val > 0:
+                range_pct_val = (rng_high - rng_low) / rng_mid_val * 100
+                if min_range_pct > 0 and range_pct_val < min_range_pct:
+                    result.skipped_days.append(SkippedDay(
+                        date=date_str, reason="TIGHT_RANGE",
+                        detail=f"ORB range {range_pct_val:.2f}% < min {min_range_pct:.1f}%.",
+                    ))
+                    continue
+                if max_range_pct > 0 and range_pct_val > max_range_pct:
+                    result.skipped_days.append(SkippedDay(
+                        date=date_str, reason="WIDE_RANGE",
+                        detail=f"ORB range {range_pct_val:.2f}% > max {max_range_pct:.1f}%.",
+                    ))
+                    continue
+
+            # ── Gap direction pre-filter ──────────────────────────────────────
+            # Use the first market-open bar's open price — matches bot.py which stores
+            # day_gap_pct = (state.bars[0].open - prev_close) / prev_close * 100
+            prev_close_val = _prev_close_by_date.get(trade_date, 0.0)
+            day_gap_pct = 0.0
+            if prev_close_val > 0:
+                first_open = float(orb_bars.iloc[0]["open"])
+                day_gap_pct = round((first_open - prev_close_val) / prev_close_val * 100, 2)
+
+            # ── Earnings / large-gap skip ─────────────────────────────────────
+            if max_gap_abs_pct > 0 and abs(day_gap_pct) > max_gap_abs_pct:
+                result.skipped_days.append(SkippedDay(
+                    date=date_str, reason="EARNINGS_GAP",
+                    detail=f"Gap {day_gap_pct:.1f}% exceeds ±{max_gap_abs_pct:.1f}% threshold.",
+                ))
+                continue
+
+            # ── First bar direction bias ──────────────────────────────────────
+            first_bar_bias = ""
+            if not orb_bars.empty:
+                fb = orb_bars.iloc[0]
+                if fb["close"] > fb["open"]:
+                    first_bar_bias = "LONG"
+                elif fb["close"] < fb["open"]:
+                    first_bar_bias = "SHORT"
+
             if all_post_orb.empty or scan_bars.empty:
                 result.skipped_days.append(SkippedDay(
                     date=date_str, reason="NO_SIGNAL",
@@ -348,6 +494,8 @@ class BacktestEngine:
             close_vals  = scan_bars["close"].values
             vwap_vals   = scan_bars["_vwap"].values
             volume_vals = scan_bars["volume"].values
+            high_vals   = scan_bars["high"].values
+            low_vals    = scan_bars["low"].values
 
             avg_orb_vol = orb_bars["volume"].mean() if not orb_bars.empty else 0.0
 
@@ -360,6 +508,8 @@ class BacktestEngine:
                 bar_close  = close_vals[i]
                 bar_vwap   = vwap_vals[i]
                 bar_volume = volume_vals[i]
+                bar_high   = high_vals[i]
+                bar_low    = low_vals[i]
 
                 if bar_close > rng_high:
                     candidate = "LONG"
@@ -367,6 +517,27 @@ class BacktestEngine:
                     candidate = "SHORT"
                 else:
                     continue
+
+                if gap_direction_filter and abs(day_gap_pct) >= gap_min_pct:
+                    if candidate == "LONG" and day_gap_pct < 0:
+                        last_reason = f"GAP_DIR gap={day_gap_pct:.2f}% (gap-down), LONG blocked"
+                        continue
+                    if candidate == "SHORT" and day_gap_pct > 0:
+                        last_reason = f"GAP_DIR gap={day_gap_pct:.2f}% (gap-up), SHORT blocked"
+                        continue
+
+                # SPY trend filter (day-level — break out of scan loop if blocked)
+                if spy_filter:
+                    spy_bias = _spy_bias_by_date.get(trade_date, "NEUTRAL")
+                    if spy_bias != "NEUTRAL" and candidate != spy_bias:
+                        last_reason = f"SPY_BIAS spy={spy_bias}, signal={candidate} blocked"
+                        break  # day-level filter — no point scanning further bars
+
+                # First bar direction filter (day-level — break out of scan loop)
+                if first_bar_filter and first_bar_bias:
+                    if candidate != first_bar_bias:
+                        last_reason = f"FIRST_BAR_BIAS bar={first_bar_bias}, signal={candidate} blocked"
+                        break  # day-level filter
 
                 if vwap_filter:
                     if candidate == "LONG" and bar_close <= bar_vwap:
@@ -381,6 +552,41 @@ class BacktestEngine:
                         last_reason = (f"LOW_VOL_SURGE {bar_volume:,.0f} < "
                                        f"{volume_surge_mult:.1f}×{avg_orb_vol:,.0f}")
                         continue
+
+                hist_ov = _hist_orb_vol_by_date.get(trade_date, 0.0)
+                if rvol_mult > 0 and hist_ov > 0:
+                    if bar_volume < hist_ov * rvol_mult:
+                        last_reason = f"LOW_HIST_RVOL {bar_volume:,.0f} < {rvol_mult:.1f}×{hist_ov:,.0f}"
+                        continue
+
+                # Breakout strength: close must extend X% beyond the ORB boundary
+                if min_breakout_strength_pct > 0:
+                    boundary = rng_high if candidate == "LONG" else rng_low
+                    if candidate == "LONG":
+                        min_close = boundary * (1 + min_breakout_strength_pct / 100)
+                        if bar_close < min_close:
+                            last_reason = f"WEAK_STRENGTH close={bar_close:.2f} < {min_close:.2f}"
+                            continue
+                    else:
+                        max_close = boundary * (1 - min_breakout_strength_pct / 100)
+                        if bar_close > max_close:
+                            last_reason = f"WEAK_STRENGTH close={bar_close:.2f} > {max_close:.2f}"
+                            continue
+
+                # Bar quality: close must be in the top (LONG) or bottom (SHORT) fraction
+                if min_bar_close_ratio > 0:
+                    br = bar_high - bar_low
+                    if br > 0:
+                        if candidate == "LONG":
+                            close_ratio = (bar_close - bar_low) / br
+                            if close_ratio < min_bar_close_ratio:
+                                last_reason = f"WEAK_BAR_CLOSE ratio={close_ratio:.2f} < {min_bar_close_ratio:.2f}"
+                                continue
+                        else:
+                            close_ratio = (bar_high - bar_close) / br
+                            if close_ratio < min_bar_close_ratio:
+                                last_reason = f"WEAK_BAR_CLOSE ratio={close_ratio:.2f} < {min_bar_close_ratio:.2f}"
+                                continue
 
                 entry_iloc = i
                 side       = candidate
@@ -399,6 +605,35 @@ class BacktestEngine:
 
             signal_bar = scan_bars.iloc[entry_iloc]
             signal_ts  = signal_bar["timestamp"]
+
+            # ── Max-chase / pullback-entry filter ─────────────────────────────
+            if max_chase_pct > 0:
+                boundary  = rng_high if side == "LONG" else rng_low
+                sig_close = float(signal_bar["close"])
+                chase_pct = abs(sig_close - boundary) / boundary * 100
+                if chase_pct > max_chase_pct:
+                    # Scan next pullback_bars bars for a retrace
+                    pb_candidates = all_post_orb[all_post_orb["timestamp"] > signal_ts].head(pullback_bars)
+                    retrace_ts = None
+                    for _, pb_bar in pb_candidates.iterrows():
+                        if side == "LONG":
+                            touch_threshold = boundary * (1 + max_chase_pct / 200)
+                            if float(pb_bar["low"]) <= touch_threshold:
+                                retrace_ts = pb_bar["timestamp"]
+                                break
+                        else:
+                            touch_threshold = boundary * (1 - max_chase_pct / 200)
+                            if float(pb_bar["high"]) >= touch_threshold:
+                                retrace_ts = pb_bar["timestamp"]
+                                break
+                    if retrace_ts is None:
+                        result.skipped_days.append(SkippedDay(
+                            date=date_str, reason="NO_FILL",
+                            detail=(f"Chase {chase_pct:.2f}% > {max_chase_pct:.2f}% and no "
+                                    f"pullback within {pullback_bars} bars."),
+                        ))
+                        continue
+                    signal_ts = retrace_ts
 
             # ── Stop-limit entry: executes on the BAR AFTER the signal bar ─────
             # Bot submits a DAY stop-limit after bar close; fill happens on the
@@ -486,15 +721,54 @@ class BacktestEngine:
                 ))
                 continue
 
-            # Sizing: full starting_equity into each trade
-            total_qty = max(1, math.floor(starting_equity / entry_price))
-
-            # Target price — bot.py uses ORB range (not risk_per_share) as the R unit
-            orb_range_r = rng_high - rng_low
-            if side == "LONG":
-                tp_px = round(entry_stop + orb_range_r * risk_ratio, 2)
+            # ── TP taper: reduce risk_ratio based on signal bar time ──────────
+            sig_h = signal_bar["timestamp"].hour
+            sig_m = signal_bar["timestamp"].minute
+            if tp_taper:
+                if (sig_h, sig_m) >= (tp_taper_2_hour, tp_taper_2_min):
+                    effective_ratio = risk_ratio * tp_taper_2_mult
+                elif (sig_h, sig_m) >= (tp_taper_1_hour, tp_taper_1_min):
+                    effective_ratio = risk_ratio * tp_taper_1_mult
+                else:
+                    effective_ratio = risk_ratio
             else:
-                tp_px = round(entry_stop - orb_range_r * risk_ratio, 2)
+                effective_ratio = risk_ratio
+
+            # Position sizing: compounds with current_equity (starts at starting_equity,
+            # grows/shrinks after each closed trade — matches real account behaviour)
+            if risk_pct_equity > 0:
+                risk_dollar = current_equity * risk_pct_equity / 100.0
+                total_qty   = max(1, math.floor(risk_dollar / risk_per_share))
+            elif position_size_usd > 0:
+                total_qty = max(1, math.floor(position_size_usd / entry_price))
+            else:
+                total_qty = max(1, math.floor(current_equity / entry_price))
+            if max_position_usd > 0:
+                total_qty = min(total_qty, max(1, math.floor(max_position_usd / entry_price)))
+            if max_leverage_pct > 0:
+                max_pos_qty = max(1, math.floor(
+                    current_equity * max_leverage_pct / 100.0 / entry_price
+                ))
+                total_qty = min(total_qty, max_pos_qty)
+
+            # Target prices — bot.py uses ORB range (not risk_per_share) as the R unit
+            orb_range_r = rng_high - rng_low
+            if tp1_r > 0 and tp2_r > 0:
+                tp1_price = (
+                    round(entry_stop + orb_range_r * tp1_r, 2) if side == "LONG"
+                    else round(entry_stop - orb_range_r * tp1_r, 2)
+                )
+                tp2_price = (
+                    round(entry_stop + orb_range_r * tp2_r, 2) if side == "LONG"
+                    else round(entry_stop - orb_range_r * tp2_r, 2)
+                )
+                tp_px = tp2_price
+            else:
+                tp_px = (
+                    round(entry_stop + orb_range_r * effective_ratio, 2) if side == "LONG"
+                    else round(entry_stop - orb_range_r * effective_ratio, 2)
+                )
+                tp1_price = tp2_price = None
 
             # Fee helper (regulatory pass-through, sell side only)
             def _fee(q: int, sell_px: float) -> float:
@@ -504,73 +778,326 @@ class BacktestEngine:
                     4,
                 )
 
-            # ── Exit: bars after the execution bar (no time-of-day cap) ───────────
+            # ── Exit: bars after the execution bar (no time-of-day cap) ──────────
             after_entry = all_post_orb[all_post_orb["timestamp"] > entry_ts]
 
-            if after_entry.empty:
-                eod_close   = float(exec_bar["close"])
-                exit_px     = round(eod_close - slip, 2) if side == "LONG" else round(eod_close + slip, 2)
-                exit_reason = "EOD"
-                exit_ts     = entry_ts
+            if tp1_r > 0 and tp2_r > 0:
+                # ── Two-leg scale-out ──────────────────────────────────────────
+                qty1 = max(1, total_qty // 2)
+                qty2 = total_qty - qty1
+
+                if after_entry.empty:
+                    eod_px = float(exec_bar["close"])
+                    leg1_ep = leg2_ep = (
+                        round(eod_px - slip, 2) if side == "LONG" else round(eod_px + slip, 2)
+                    )
+                    exit_ts          = entry_ts
+                    exit_reason      = "EOD"
+                    leg1_exit_reason = None
+                    final_qty1, final_qty2 = qty1, qty2
+                else:
+                    if side == "LONG":
+                        tp1_mask = after_entry["high"].values >= tp1_price
+                        sl1_mask = after_entry["low"].values  <= sl
+                    else:
+                        tp1_mask = after_entry["low"].values  <= tp1_price
+                        sl1_mask = after_entry["high"].values >= sl
+
+                    tp1_i = int(tp1_mask.argmax()) if tp1_mask.any() else len(after_entry)
+                    sl1_i = int(sl1_mask.argmax()) if sl1_mask.any() else len(after_entry)
+
+                    # Failed-breakout exit (two-leg): exits full position before TP1 or SL
+                    fb1_i = len(after_entry)
+                    if failed_breakout_exit:
+                        fb1_mask = (after_entry["close"].values < rng_high if side == "LONG"
+                                    else after_entry["close"].values > rng_low)
+                        if fb1_mask.any():
+                            fb1_i = int(fb1_mask.argmax())
+
+                    if failed_breakout_exit and fb1_i < sl1_i and fb1_i < tp1_i:
+                        # Failed breakout — exit full position at close of that bar
+                        fb1_close = float(after_entry.iloc[fb1_i]["close"])
+                        leg1_ep = leg2_ep = (
+                            round(fb1_close - slip, 2) if side == "LONG" else round(fb1_close + slip, 2)
+                        )
+                        exit_ts          = after_entry.iloc[fb1_i]["timestamp"]
+                        exit_reason      = "FB"
+                        leg1_exit_reason = None
+                        final_qty1, final_qty2 = total_qty, 0
+
+                    elif sl1_mask.any() and sl1_i <= tp1_i:
+                        # SL hit before TP1 — full position exits at SL
+                        leg1_ep = leg2_ep = (
+                            round(sl - slip, 2) if side == "LONG" else round(sl + slip, 2)
+                        )
+                        exit_ts          = after_entry.iloc[sl1_i]["timestamp"]
+                        exit_reason      = "SL"
+                        leg1_exit_reason = None
+                        final_qty1, final_qty2 = total_qty, 0
+
+                    elif tp1_mask.any():
+                        # TP1 hit — half exits, remainder continues with BE stop
+                        leg1_ep = (
+                            round(tp1_price - slip, 2) if side == "LONG"
+                            else round(tp1_price + slip, 2)
+                        )
+                        leg1_exit_reason = "TP1"
+                        phase2   = after_entry.iloc[tp1_i + 1:]
+                        be_stop  = entry_price
+
+                        if phase2.empty:
+                            last_row  = after_entry.iloc[-1]
+                            eod_close = float(last_row["close"])
+                            leg2_ep = (
+                                round(eod_close - slip, 2) if side == "LONG"
+                                else round(eod_close + slip, 2)
+                            )
+                            exit_ts          = last_row["timestamp"]
+                            leg2_exit_reason = "EOD"
+                        else:
+                            if side == "LONG":
+                                tp2_mask = phase2["high"].values >= tp2_price
+                                be_mask  = phase2["low"].values  <= be_stop
+                            else:
+                                tp2_mask = phase2["low"].values  <= tp2_price
+                                be_mask  = phase2["high"].values >= be_stop
+
+                            tp2_i2 = int(tp2_mask.argmax()) if tp2_mask.any() else len(phase2)
+                            be_i2  = int(be_mask.argmax())  if be_mask.any()  else len(phase2)
+
+                            if tp2_mask.any() and tp2_i2 <= be_i2:
+                                leg2_ep = (
+                                    round(tp2_price - slip, 2) if side == "LONG"
+                                    else round(tp2_price + slip, 2)
+                                )
+                                exit_ts          = phase2.iloc[tp2_i2]["timestamp"]
+                                leg2_exit_reason = "TP2"
+                            elif be_mask.any():
+                                leg2_ep = round(be_stop, 2)
+                                exit_ts          = phase2.iloc[be_i2]["timestamp"]
+                                leg2_exit_reason = "BE"
+                            else:
+                                eod_close = float(phase2.iloc[-1]["close"])
+                                leg2_ep = (
+                                    round(eod_close - slip, 2) if side == "LONG"
+                                    else round(eod_close + slip, 2)
+                                )
+                                exit_ts          = phase2.iloc[-1]["timestamp"]
+                                leg2_exit_reason = "EOD"
+
+                        exit_reason    = f"TP1+{leg2_exit_reason}"
+                        final_qty1, final_qty2 = qty1, qty2
+
+                    else:
+                        # EOD — price never reached TP1 or SL
+                        last_row  = after_entry.iloc[-1]
+                        eod_close = float(last_row["close"])
+                        leg1_ep = leg2_ep = (
+                            round(eod_close - slip, 2) if side == "LONG"
+                            else round(eod_close + slip, 2)
+                        )
+                        exit_ts          = last_row["timestamp"]
+                        exit_reason      = "EOD"
+                        leg1_exit_reason = None
+                        final_qty1, final_qty2 = qty1, qty2
+
+                def _raw(ep: float) -> float:
+                    return (ep - entry_price) if side == "LONG" else (entry_price - ep)
+
+                sell1_px = leg1_ep if side == "LONG" else entry_price
+                sell2_px = leg2_ep if side == "LONG" else entry_price
+                fees1    = _fee(final_qty1, sell1_px)
+                fees2    = _fee(final_qty2, sell2_px) if final_qty2 > 0 else 0.0
+                pnl1     = round(_raw(leg1_ep) * final_qty1 - fees1, 2)
+                pnl2     = round(_raw(leg2_ep) * final_qty2 - fees2, 2) if final_qty2 > 0 else 0.0
+                pnl        = round(pnl1 + pnl2, 2)
+                total_fees = round(fees1 + fees2, 4)
+                exit_px    = (
+                    round((leg1_ep * final_qty1 + leg2_ep * final_qty2) / total_qty, 2)
+                    if final_qty2 > 0 else leg1_ep
+                )
+                r_mult = round(pnl / (risk_per_share * total_qty), 2) if risk_per_share > 0 else 0.0
+                leg1_pnl_val = pnl1 if leg1_exit_reason == "TP1" else None
+
+                result.trades.append(BacktestTrade(
+                    date             = date_str,
+                    symbol           = symbol,
+                    side             = side,
+                    entry_time       = str(exec_bar["timestamp"]),
+                    entry_price      = entry_price,
+                    take_profit      = tp2_price,
+                    stop_loss        = sl,
+                    range_high       = round(rng_high, 2),
+                    range_low        = round(rng_low,  2),
+                    exit_time        = str(exit_ts),
+                    exit_price       = exit_px,
+                    exit_reason      = exit_reason,
+                    qty              = total_qty,
+                    fees             = total_fees,
+                    pnl              = pnl,
+                    r_multiple       = r_mult,
+                    tp1_price        = tp1_price,
+                    tp2_price        = tp2_price,
+                    leg1_exit_reason = leg1_exit_reason,
+                    leg1_pnl         = leg1_pnl_val,
+                    gap_pct          = day_gap_pct,
+                ))
+
             else:
-                if side == "LONG":
-                    tp_hit = after_entry["high"].values >= tp_px
-                    sl_hit = after_entry["low"].values  <= sl
-                else:
-                    tp_hit = after_entry["low"].values  <= tp_px
-                    sl_hit = after_entry["high"].values >= sl
-
-                tp_i = int(tp_hit.argmax()) if tp_hit.any() else len(after_entry)
-                sl_i = int(sl_hit.argmax()) if sl_hit.any() else len(after_entry)
-
-                if tp_hit.any() and tp_i < sl_i:
-                    exit_reason = "TP"
-                    exit_row    = after_entry.iloc[tp_i]
-                    exit_px     = round(tp_px - slip, 2) if side == "LONG" else round(tp_px + slip, 2)
-                elif sl_hit.any():
-                    exit_reason = "SL"
-                    exit_row    = after_entry.iloc[sl_i]
-                    exit_px     = round(sl - slip, 2) if side == "LONG" else round(sl + slip, 2)
-                else:
-                    exit_reason = "EOD"
-                    exit_row    = after_entry.iloc[-1]
-                    eod_close   = float(exit_row["close"])
+                # ── Single-leg exit ────────────────────────────────────────────
+                if after_entry.empty:
+                    eod_close   = float(exec_bar["close"])
                     exit_px     = round(eod_close - slip, 2) if side == "LONG" else round(eod_close + slip, 2)
-                exit_ts = exit_row["timestamp"]
+                    exit_reason = "EOD"
+                    exit_ts     = entry_ts
+                else:
+                    if side == "LONG":
+                        tp_hit = after_entry["high"].values >= tp_px
+                        sl_hit = after_entry["low"].values  <= sl
+                    else:
+                        tp_hit = after_entry["low"].values  <= tp_px
+                        sl_hit = after_entry["high"].values >= sl
 
-            sell_px = exit_px if side == "LONG" else entry_price
-            fees    = _fee(total_qty, sell_px)
-            raw_pnl = (exit_px - entry_price) if side == "LONG" else (entry_price - exit_px)
-            pnl     = round(raw_pnl * total_qty - fees, 2)
-            r_mult  = round(raw_pnl / risk_per_share, 2)
+                    tp_i = int(tp_hit.argmax()) if tp_hit.any() else len(after_entry)
+                    sl_i = int(sl_hit.argmax()) if sl_hit.any() else len(after_entry)
 
-            result.trades.append(BacktestTrade(
-                date        = date_str,
-                symbol      = symbol,
-                side        = side,
-                entry_time  = str(exec_bar["timestamp"]),
-                entry_price = entry_price,
-                take_profit = tp_px,
-                stop_loss   = sl,
-                range_high  = round(rng_high, 2),
-                range_low   = round(rng_low,  2),
-                exit_time   = str(exit_ts),
-                exit_price  = round(exit_px, 2),
-                exit_reason = exit_reason,
-                qty         = total_qty,
-                fees        = fees,
-                pnl         = pnl,
-                r_multiple  = r_mult,
-            ))
+                    # Failed-breakout exit: price closes back inside ORB (earlier than SL)
+                    fb_i = len(after_entry)
+                    if failed_breakout_exit:
+                        fb_mask = (after_entry["close"].values < rng_high if side == "LONG"
+                                   else after_entry["close"].values > rng_low)
+                        if fb_mask.any():
+                            fb_i = int(fb_mask.argmax())
 
-        result.stats        = _compute_stats(result.trades, len(result.skipped_days))
-        result.equity_curve = _equity_curve(result.trades)
+                    if tp_hit.any() and tp_i < sl_i and tp_i <= fb_i:
+                        exit_reason = "TP"
+                        exit_row    = after_entry.iloc[tp_i]
+                        exit_px     = round(tp_px - slip, 2) if side == "LONG" else round(tp_px + slip, 2)
+                    elif sl_hit.any() and sl_i <= fb_i:
+                        exit_reason = "SL"
+                        exit_row    = after_entry.iloc[sl_i]
+                        exit_px     = round(sl - slip, 2) if side == "LONG" else round(sl + slip, 2)
+                    elif failed_breakout_exit and fb_i < len(after_entry):
+                        exit_reason = "FB"
+                        exit_row    = after_entry.iloc[fb_i]
+                        fb_close    = float(exit_row["close"])
+                        exit_px     = round(fb_close - slip, 2) if side == "LONG" else round(fb_close + slip, 2)
+                    else:
+                        exit_reason = "EOD"
+                        exit_row    = after_entry.iloc[-1]
+                        eod_close   = float(exit_row["close"])
+                        exit_px     = round(eod_close - slip, 2) if side == "LONG" else round(eod_close + slip, 2)
+                    exit_ts = exit_row["timestamp"]
+
+                sell_px = exit_px if side == "LONG" else entry_price
+                fees    = _fee(total_qty, sell_px)
+                raw_pnl = (exit_px - entry_price) if side == "LONG" else (entry_price - exit_px)
+                pnl     = round(raw_pnl * total_qty - fees, 2)
+                r_mult  = round(raw_pnl / risk_per_share, 2)
+
+                result.trades.append(BacktestTrade(
+                    date        = date_str,
+                    symbol      = symbol,
+                    side        = side,
+                    entry_time  = str(exec_bar["timestamp"]),
+                    entry_price = entry_price,
+                    take_profit = tp_px,
+                    stop_loss   = sl,
+                    range_high  = round(rng_high, 2),
+                    range_low   = round(rng_low,  2),
+                    exit_time   = str(exit_ts),
+                    exit_price  = round(exit_px, 2),
+                    exit_reason = exit_reason,
+                    qty         = total_qty,
+                    fees        = fees,
+                    pnl         = pnl,
+                    r_multiple  = r_mult,
+                    gap_pct     = day_gap_pct,
+                ))
+            current_equity = round(current_equity + pnl, 2)
+
+        result.stats           = _compute_stats(result.trades, len(result.skipped_days), starting_equity)
+        result.equity_curve    = _equity_curve(result.trades, starting_equity)
+        result.spy_equity_curve = _spy_equity_curve
+        result.spy_dates        = _spy_dates
         return result
+
+    # ── Portfolio Backtest ─────────────────────────────────────────────────────
+
+    def run_portfolio_backtest(
+        self,
+        symbols: List[str],
+        start_date: date,
+        end_date: date,
+        **kwargs,
+    ):
+        """
+        Run the ORB strategy across multiple symbols and combine into one portfolio result.
+
+        Each symbol is run with the full starting_equity — matching live-bot behaviour
+        where every symbol risks risk_pct_equity % of the account independently.
+        Trades are merged in chronological order and a single equity curve is built by
+        accumulating all PnLs from starting_equity.
+
+        Returns (portfolio_result: BacktestResult, per_symbol: List[BacktestResult])
+        """
+        starting_equity: float = kwargs.get("starting_equity", 100_000.0)
+
+        per_symbol: List[BacktestResult] = []
+        spy_equity_curve: List[float]    = []
+        spy_dates: List[str]             = []
+
+        for sym in symbols:
+            r = self.run_backtest(sym, start_date, end_date, **kwargs)
+            per_symbol.append(r)
+            if not spy_equity_curve and r.spy_equity_curve:
+                spy_equity_curve = r.spy_equity_curve
+                spy_dates        = r.spy_dates
+
+        # Merge all trades chronologically
+        all_trades: List[BacktestTrade] = []
+        total_skipped = 0
+        for r in per_symbol:
+            all_trades.extend(r.trades)
+            total_skipped += len(r.skipped_days)
+        all_trades.sort(key=lambda t: (t.date, t.entry_time))
+
+        # Portfolio label
+        shown = symbols[:4]
+        label = "Portfolio (" + ", ".join(shown)
+        if len(symbols) > 4:
+            label += f" +{len(symbols) - 4}"
+        label += ")"
+
+        orb_min = kwargs.get("orb_minutes", 15)
+
+        portfolio = BacktestResult(
+            symbol            = label,
+            start_date        = str(start_date),
+            end_date          = str(end_date),
+            orb_minutes       = orb_min,
+            risk_ratio        = kwargs.get("risk_ratio", 2.0),
+            stop_loss_type    = kwargs.get("stop_loss_type", "midpoint"),
+            position_size_usd = kwargs.get("position_size_usd", 0.0),
+            risk_pct_equity   = kwargs.get("risk_pct_equity", 1.0),
+            starting_equity   = starting_equity,
+            trades            = all_trades,
+            spy_equity_curve  = spy_equity_curve,
+            spy_dates         = spy_dates,
+        )
+        portfolio.stats        = _compute_stats(all_trades, total_skipped, starting_equity)
+        portfolio.equity_curve = _equity_curve(all_trades, starting_equity)
+
+        return portfolio, per_symbol
 
 
 # ── Statistics ─────────────────────────────────────────────────────────────────
 
-def _compute_stats(trades: List[BacktestTrade], days_skipped: int = 0) -> BacktestStats:
+def _compute_stats(
+    trades: List[BacktestTrade],
+    days_skipped: int = 0,
+    starting_equity: float = 100_000.0,
+) -> BacktestStats:
     if not trades:
         return BacktestStats(days_skipped_no_data=days_skipped)
 
@@ -590,15 +1117,16 @@ def _compute_stats(trades: List[BacktestTrade], days_skipped: int = 0) -> Backte
         if dd > max_dd:
             max_dd = dd
 
+    total_pnl    = sum(pnls)
     win_pct      = len(wins)   / len(trades)
     loss_pct     = len(losses) / len(trades)
     avg_win_val  = sum(wins)   / len(wins)   if wins   else 0.0
     avg_loss_val = sum(losses) / len(losses) if losses else 0.0
 
     expectancy      = round(win_pct * avg_win_val + loss_pct * avg_loss_val, 2)
-    recovery_factor = round(sum(pnls) / max_dd, 2) if max_dd > 0 else float("inf")
+    recovery_factor = round(total_pnl / max_dd, 2) if max_dd > 0 else float("inf")
     sharpe          = round(
-        (sum(pnls) / len(pnls)) / statistics.stdev(pnls), 2
+        (total_pnl / len(pnls)) / statistics.stdev(pnls), 2
     ) if len(pnls) >= 2 and statistics.stdev(pnls) > 0 else 0.0
 
     return BacktestStats(
@@ -606,11 +1134,13 @@ def _compute_stats(trades: List[BacktestTrade], days_skipped: int = 0) -> Backte
         winning_trades       = len(wins),
         losing_trades        = len(losses),
         win_rate             = round(win_pct * 100, 1),
-        total_pnl            = round(sum(pnls), 2),
+        total_pnl            = round(total_pnl, 2),
+        total_return_pct     = round(total_pnl / starting_equity * 100, 2) if starting_equity else 0.0,
         avg_win              = round(avg_win_val,  2),
         avg_loss             = round(avg_loss_val, 2),
         profit_factor        = round(gross_profit / gross_loss, 2) if gross_loss else float("inf"),
         max_drawdown         = round(max_dd, 2),
+        max_drawdown_pct     = round(max_dd / starting_equity * 100, 2) if starting_equity else 0.0,
         avg_r_multiple       = round(sum(t.r_multiple for t in trades) / len(trades), 2),
         best_trade           = round(max(pnls), 2),
         worst_trade          = round(min(pnls), 2),
@@ -623,8 +1153,9 @@ def _compute_stats(trades: List[BacktestTrade], days_skipped: int = 0) -> Backte
     )
 
 
-def _equity_curve(trades: List[BacktestTrade]) -> List[float]:
-    curve, equity = [], 0.0
+def _equity_curve(trades: List[BacktestTrade], starting_equity: float = 100_000.0) -> List[float]:
+    curve  = [round(starting_equity, 2)]  # anchor: same starting point as SPY baseline
+    equity = starting_equity
     for t in trades:
         equity += t.pnl
         curve.append(round(equity, 2))

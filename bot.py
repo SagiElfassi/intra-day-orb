@@ -54,6 +54,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
 from alpaca.trading.requests import (
+    GetOrdersRequest,
     MarketOrderRequest,
     StopLimitOrderRequest,
     StopLossRequest,
@@ -114,6 +115,18 @@ class Config:
                 ("min_orb_volume", int),    ("min_atr_pct", float),     ("max_spread_pct", float),
                 ("risk_pct_equity", float), ("max_position_usd", float),("risk_ratio", float),
                 ("volume_surge_mult", float),("vwap_filter", bool),
+                ("min_range_pct", float),   ("max_range_pct", float),
+                ("gap_direction_filter", bool), ("gap_min_pct", float),
+                ("spy_filter", bool), ("spy_sma_period", int),
+                ("max_chase_pct", float), ("pullback_bars", int),
+                ("max_gap_abs_pct", float), ("first_bar_filter", bool),
+                ("tp_taper", bool), ("tp_taper_1_hour", int), ("tp_taper_1_min", int),
+                ("tp_taper_1_mult", float), ("tp_taper_2_hour", int), ("tp_taper_2_min", int),
+                ("tp_taper_2_mult", float), ("rvol_mult", float),
+                ("min_breakout_strength_pct", float), ("min_bar_close_ratio", float),
+                ("failed_breakout_exit", bool),
+                ("atr_sl_mult", float), ("max_leverage_pct", float),
+                ("entry_limit_offset_pct", float),
             ]
             for attr, cast in scalar_fields:
                 if attr in saved:
@@ -135,7 +148,7 @@ class Config:
     symbols: List[str] = field(
         default_factory=lambda: [
             s.strip().upper()
-            for s in os.environ.get("SYMBOLS", "SPY,QQQ,AAPL,META,TSLA").split(",")
+            for s in os.environ.get("SYMBOLS", "TSLA,NVDA,AMD,META,COIN").split(",")
         ]
     )
 
@@ -168,6 +181,49 @@ class Config:
 
     # Stop-limit entry: limit_price offset from stop_price (fraction, e.g. 0.005 = 0.5%)
     entry_limit_offset_pct: float = 0.005
+
+    # ORB range quality: skip if range is too tight (noise) or too wide (bad R:R). 0 = disabled.
+    min_range_pct: float = 0.0   # min ORB range as % of price
+    max_range_pct: float = 0.0   # max ORB range as % of price
+
+    # Gap direction filter: only take signals aligned with the pre-market gap direction.
+    gap_direction_filter: bool = False
+    gap_min_pct: float = 0.5     # minimum gap % magnitude to activate the filter
+
+    # SPY trend filter: only LONG when SPY > 20-day SMA, only SHORT when below.
+    spy_filter: bool = False
+    spy_sma_period: int = 20
+
+    # Max-chase / pullback-entry filter
+    max_chase_pct: float = 0.0   # 0 = disabled
+    pullback_bars: int = 3
+
+    # Earnings / large-gap skip
+    max_gap_abs_pct: float = 0.0  # 0 = disabled
+
+    # First 5-min candle direction filter
+    first_bar_filter: bool = False
+
+    # Time-of-day TP taper
+    tp_taper: bool = False
+    tp_taper_1_hour: int = 10
+    tp_taper_1_min: int = 15
+    tp_taper_1_mult: float = 0.75
+    tp_taper_2_hour: int = 10
+    tp_taper_2_min: int = 45
+    tp_taper_2_mult: float = 0.50
+
+    # Historical RVOL filter
+    rvol_mult: float = 0.0        # 0 = disabled
+
+    # Signal quality filters
+    min_breakout_strength_pct: float = 0.0  # close must extend X% beyond ORB boundary; 0 = disabled
+    min_bar_close_ratio: float = 0.0         # close must be in top/bottom X fraction of bar; 0 = disabled
+    failed_breakout_exit: bool = False       # exit position if price closes back inside ORB
+
+    # Opening-period volume concentration: first 15 min see ~3.5× more volume per minute
+    # than the intraday average.  Used to correct hist_orb_vol baseline.
+    orb_volume_factor: float = 3.5
 
     # Hard leverage cap: max position value as % of account equity (0 = unlimited)
     max_leverage_pct: float = 25.0
@@ -235,8 +291,22 @@ class TickerState:
     # ATR (% of price) cached at range-finalization for use in SL calculation
     atr_pct: float = 0.0
 
+    # Gap % vs yesterday's close (positive = gap-up, negative = gap-down)
+    day_gap_pct: float = 0.0
+
     # 1-entry-per-day guardrail: True once an order is successfully submitted
     has_entered_today: bool = False
+
+    # First bar direction bias (set in _finalize_range)
+    first_bar_bias: str = ""   # "LONG" | "SHORT" | ""
+
+    # Pullback-entry state
+    awaiting_pullback: bool = False
+    pullback_signal: str = ""
+    pullback_bars_left: int = 0
+
+    # Historical ORB volume (20-day rolling average, set in _finalize_range)
+    hist_orb_vol: float = 0.0
 
 
 # ── Database Manager ───────────────────────────────────────────────────────────
@@ -306,8 +376,9 @@ class DatabaseManager:
             for stmt in migrations:
                 try:
                     await db.execute(stmt)
-                except Exception:
-                    pass  # column already exists
+                except Exception as _e:
+                    if "duplicate column" not in str(_e).lower() and "already exists" not in str(_e).lower():
+                        logger.warning("Migration skipped (%s): %s", stmt[:40], _e)
             await db.commit()
         logger.info("Database initialized at %s", self.db_path)
 
@@ -375,32 +446,30 @@ class DatabaseManager:
             )
             await db.commit()
 
-    async def fetch_orb_bars(self, symbol: str, today: str, orb_end_minute: int) -> list:
-        """Return bars from 9:30 AM up to orb_end_minute for range seeding."""
+    async def fetch_orb_bars(self, symbol: str, today: str,
+                             orb_start_utc: str, orb_end_utc: str) -> list:
+        """Return ORB-window bars using UTC time boundaries (timestamps stored as UTC)."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                """SELECT high, low, close, volume FROM price_bars
+                """SELECT open, high, low, close, volume FROM price_bars
                    WHERE symbol=? AND DATE(timestamp)=?
-                     AND (strftime('%H','timestamp') = '09'
-                          AND CAST(strftime('%M','timestamp') AS INTEGER) BETWEEN 30 AND ?)
+                     AND time(timestamp) >= ? AND time(timestamp) < ?
                    ORDER BY timestamp""",
-                (symbol, today, orb_end_minute - 1),
+                (symbol, today, orb_start_utc, orb_end_utc),
             )
             return [dict(r) for r in await cursor.fetchall()]
 
-    async def fetch_all_bars_today(self, symbol: str, today: str) -> list:
-        """Return all bars for today at or after 9:30 AM for VWAP reconstruction."""
+    async def fetch_all_bars_today(self, symbol: str, today: str, mkt_open_utc: str) -> list:
+        """Return all bars at or after market open (UTC) for VWAP reconstruction."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """SELECT high, low, close, volume FROM price_bars
                    WHERE symbol=? AND DATE(timestamp)=?
-                     AND (strftime('%H','timestamp') > '09'
-                          OR (strftime('%H','timestamp') = '09'
-                              AND CAST(strftime('%M','timestamp') AS INTEGER) >= 30))
+                     AND time(timestamp) >= ?
                    ORDER BY timestamp""",
-                (symbol, today),
+                (symbol, today, mkt_open_utc),
             )
             return [dict(r) for r in await cursor.fetchall()]
 
@@ -441,6 +510,8 @@ class ORBBot:
         self.active_symbols: set = set(config.symbols)
 
         self.starting_equity: float = 0.0
+        self.current_equity:  float = 0.0   # refreshed every 60 s by risk monitor
+        self.spy_bias: str = "NEUTRAL"   # "LONG" | "SHORT" | "NEUTRAL"
         self.kill_switch_triggered: bool = False
         self._last_bar_time: float = 0.0
         self._stream_reconnect_lock = asyncio.Lock()
@@ -451,7 +522,40 @@ class ORBBot:
         loop    = asyncio.get_running_loop()
         account = await loop.run_in_executor(None, self.trading_client.get_account)
         self.starting_equity = float(account.equity)
+        self.current_equity  = self.starting_equity
         logger.info("Starting equity: $%.2f", self.starting_equity)
+
+    async def _fetch_spy_bias(self):
+        """Fetch SPY daily bars, compute SMA, set self.spy_bias = 'LONG'|'SHORT'|'NEUTRAL'."""
+        if not self.config.spy_filter:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            days_needed = self.config.spy_sma_period * 2  # fetch extra to ensure enough trading days
+            req = StockBarsRequest(
+                symbol_or_symbols="SPY",
+                timeframe=TimeFrame.Day,
+                start=datetime.now(timezone.utc) - timedelta(days=days_needed),
+                end=datetime.now(timezone.utc) - timedelta(days=1),
+                feed=self.config.data_feed,
+            )
+            resp = await loop.run_in_executor(None, lambda: self.historical_client.get_stock_bars(req))
+            bars = resp["SPY"]
+            if len(bars) < self.config.spy_sma_period:
+                logger.warning("SPY filter: not enough bars (%d) — bias=NEUTRAL", len(bars))
+                self.spy_bias = "NEUTRAL"
+                return
+            closes = [float(b.close) for b in bars[-self.config.spy_sma_period:]]
+            sma    = sum(closes) / len(closes)
+            last_close = float(bars[-1].close)
+            self.spy_bias = "LONG" if last_close > sma else "SHORT"
+            logger.info(
+                "SPY bias: %s (close=%.2f vs SMA%d=%.2f)",
+                self.spy_bias, last_close, self.config.spy_sma_period, sma,
+            )
+        except Exception as exc:
+            logger.warning("SPY bias fetch failed — bias=NEUTRAL: %s", exc)
+            self.spy_bias = "NEUTRAL"
 
     # ── Crash Recovery ─────────────────────────────────────────────────────────
 
@@ -554,7 +658,7 @@ class ORBBot:
                 state.bars                = []
                 state.range_high = state.range_low = state.range_mid = None
                 state.avg_orb_volume      = 0.0
-                state.order_id = state.order1_id = None
+                state.order_id = state.order1_id = state.order2_id = None
                 state.trade_db_id         = None
                 state.entry_price = state.sl_price = state.tp_price = None
                 state.side                = None
@@ -563,6 +667,11 @@ class ORBBot:
                 state.vwap_num            = 0.0
                 state.vwap_den            = 0.0
                 state.has_entered_today   = False
+                state.first_bar_bias      = ""
+                state.awaiting_pullback   = False
+                state.pullback_signal     = ""
+                state.pullback_bars_left  = 0
+                state.hist_orb_vol        = 0.0
                 state.trade_date          = today
 
             # Block new signals for these terminal/transitional states
@@ -583,6 +692,15 @@ class ORBBot:
 
             if orb_start <= bar_time_est < orb_end:
                 await self._process_range_bar(state, bar, today)
+            elif bar_time_est >= orb_end and state.status == STATUS_WAITING and state.bars:
+                # ORB window closed with fewer than orb_minutes bars (feed gap) — finalize with what arrived
+                logger.warning(
+                    "%s | ORB window closed with %d/%d bars (feed gap) — finalizing late",
+                    state.symbol, len(state.bars), self.config.orb_minutes,
+                )
+                await self._finalize_range(state, today)
+                if state.status == STATUS_SCANNING:
+                    await self._check_breakout(state, bar, today)
             elif bar_time_est >= orb_end and state.status == STATUS_SCANNING:
                 # Time-of-day filter: no new entries after trading_window_end
                 window_end = bar_time_est.replace(
@@ -642,9 +760,10 @@ class ORBBot:
             await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
             return
 
-        # ATR filter — also cache for ATR-based stop-loss
-        atr_pct = await self._fetch_atr_pct(state.symbol, state.range_high)
-        state.atr_pct = atr_pct
+        # ATR filter — also cache prev_close for gap computation and hist_orb_vol
+        atr_pct, prev_close, hist_orb_vol = await self._fetch_atr_and_prev_close(state.symbol, state.range_high)
+        state.atr_pct     = atr_pct
+        state.hist_orb_vol = hist_orb_vol
         if self.config.min_atr_pct > 0 and atr_pct < self.config.min_atr_pct:
             state.status = STATUS_INVALID
             reason = f"LOW_ATR ({atr_pct:.2f}% < {self.config.min_atr_pct:.1f}%)"
@@ -652,11 +771,46 @@ class ORBBot:
             await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
             return
 
+        # ORB range quality filter
+        range_pct = (state.range_high - state.range_low) / state.range_mid * 100
+        if self.config.min_range_pct > 0 and range_pct < self.config.min_range_pct:
+            state.status = STATUS_INVALID
+            reason = f"TIGHT_RANGE ({range_pct:.2f}% < {self.config.min_range_pct:.1f}%)"
+            logger.warning("%s | FILTER SKIP: %s", state.symbol, reason)
+            await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+            return
+        if self.config.max_range_pct > 0 and range_pct > self.config.max_range_pct:
+            state.status = STATUS_INVALID
+            reason = f"WIDE_RANGE ({range_pct:.2f}% > {self.config.max_range_pct:.1f}%)"
+            logger.warning("%s | FILTER SKIP: %s", state.symbol, reason)
+            await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+            return
+
+        # True overnight gap: first bar open vs yesterday's close
+        if prev_close > 0 and state.bars:
+            state.day_gap_pct = round((state.bars[0].open - prev_close) / prev_close * 100, 2)
+
+        # Earnings / large-gap skip
+        if self.config.max_gap_abs_pct > 0 and abs(state.day_gap_pct) > self.config.max_gap_abs_pct:
+            state.status = STATUS_INVALID
+            reason = f"EARNINGS_GAP (gap={state.day_gap_pct:.1f}% > ±{self.config.max_gap_abs_pct:.1f}%)"
+            logger.warning("%s | FILTER SKIP: %s", state.symbol, reason)
+            await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+            return
+
+        # First bar direction bias (for first_bar_filter in _check_breakout)
+        if state.bars:
+            fb = state.bars[0]
+            if fb.close > fb.open:
+                state.first_bar_bias = "LONG"
+            elif fb.close < fb.open:
+                state.first_bar_bias = "SHORT"
+
         state.status = STATUS_SCANNING
         logger.info(
-            "%s | ORB range SET — H=%.2f L=%.2f Mid=%.2f AvgVol=%.0f (bars=%d)",
+            "%s | ORB range SET — H=%.2f L=%.2f Mid=%.2f AvgVol=%.0f gap=%.1f%% (bars=%d)",
             state.symbol, state.range_high, state.range_low,
-            state.range_mid, state.avg_orb_volume, bars_received,
+            state.range_mid, state.avg_orb_volume, state.day_gap_pct, bars_received,
         )
         await self.db.save_orb_range(
             state.symbol, today,
@@ -673,6 +827,33 @@ class ORBBot:
           3. Volume surge — breakout bar must print > volume_surge_mult × avg ORB volume.
           4. Spread filter — bid-ask spread checked live via quote API.
         """
+        # ── Pullback-entry state machine — handled BEFORE normal logic ─────────
+        max_chase_pct = self.config.max_chase_pct
+        if state.awaiting_pullback:
+            state.pullback_bars_left -= 1
+            if state.pullback_signal == "LONG":
+                touch_threshold = state.range_high * (1 + max_chase_pct / 100)
+                if bar.low <= touch_threshold:
+                    state.awaiting_pullback  = False
+                    state.pullback_signal    = ""
+                    state.pullback_bars_left = 0
+                    await self._submit_bracket_order(state, bar, "LONG", today)
+                    return
+            else:  # SHORT
+                touch_threshold = state.range_low * (1 - max_chase_pct / 100)
+                if bar.high >= touch_threshold:
+                    state.awaiting_pullback  = False
+                    state.pullback_signal    = ""
+                    state.pullback_bars_left = 0
+                    await self._submit_bracket_order(state, bar, "SHORT", today)
+                    return
+            if state.pullback_bars_left > 0:
+                return  # still waiting
+            # Timeout — clear flag and fall through to normal breakout logic
+            state.awaiting_pullback  = False
+            state.pullback_signal    = ""
+            state.pullback_bars_left = 0
+
         close = bar.close
 
         if close > state.range_high:
@@ -686,6 +867,39 @@ class ORBBot:
         if state.has_entered_today:
             state.status = STATUS_COMPLETED
             return
+
+        # ── Gap direction filter — day-level, no retry ────────────────────────
+        if self.config.gap_direction_filter and abs(state.day_gap_pct) >= self.config.gap_min_pct:
+            if signal == "LONG" and state.day_gap_pct < 0:
+                reason = f"AGAINST_GAP (gap={state.day_gap_pct:.1f}% DOWN, signal=LONG)"
+                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                state.status = STATUS_COMPLETED
+                return
+            if signal == "SHORT" and state.day_gap_pct > 0:
+                reason = f"AGAINST_GAP (gap={state.day_gap_pct:.1f}% UP, signal=SHORT)"
+                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                state.status = STATUS_COMPLETED
+                return
+
+        # ── SPY trend filter — day-level, no retry ────────────────────────────
+        if self.config.spy_filter and self.spy_bias != "NEUTRAL":
+            if signal != self.spy_bias:
+                reason = f"SPY_BIAS (spy={self.spy_bias}, signal={signal})"
+                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                state.status = STATUS_COMPLETED
+                return
+
+        # ── First bar direction filter — day-level, no retry ─────────────────
+        if self.config.first_bar_filter and state.first_bar_bias:
+            if signal != state.first_bar_bias:
+                reason = f"FIRST_BAR_BIAS (bar={state.first_bar_bias}, signal={signal})"
+                logger.info("%s | FILTER SKIP: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_SKIP", f"{state.symbol}: {reason}")
+                state.status = STATUS_COMPLETED
+                return
 
         # ── VWAP confirmation ──────────────────────────────────────────────────
         if self.config.vwap_filter and state.vwap_den > 0:
@@ -711,6 +925,54 @@ class ORBBot:
                 await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
                 return
 
+        # ── Historical RVOL filter — retryable ───────────────────────────────
+        if self.config.rvol_mult > 0 and state.hist_orb_vol > 0:
+            if float(bar.volume) < state.hist_orb_vol * self.config.rvol_mult:
+                reason = (f"LOW_HIST_RVOL (bar={bar.volume:,} < "
+                          f"{self.config.rvol_mult}×hist_avg={state.hist_orb_vol:,.0f}) — retrying")
+                logger.info("%s | FILTER RETRY: %s", state.symbol, reason)
+                await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
+                return
+
+        # ── Breakout strength: close must extend X% beyond the ORB boundary ──
+        if self.config.min_breakout_strength_pct > 0:
+            boundary = state.range_high if signal == "LONG" else state.range_low
+            if signal == "LONG":
+                min_close = boundary * (1 + self.config.min_breakout_strength_pct / 100)
+                if close < min_close:
+                    reason = (f"WEAK_STRENGTH (close={close:.2f} < {min_close:.2f}) — retrying")
+                    logger.info("%s | FILTER RETRY: %s", state.symbol, reason)
+                    await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
+                    return
+            else:
+                max_close = boundary * (1 - self.config.min_breakout_strength_pct / 100)
+                if close > max_close:
+                    reason = (f"WEAK_STRENGTH (close={close:.2f} > {max_close:.2f}) — retrying")
+                    logger.info("%s | FILTER RETRY: %s", state.symbol, reason)
+                    await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
+                    return
+
+        # ── Bar quality: close must be in top (LONG) or bottom (SHORT) of bar ─
+        if self.config.min_bar_close_ratio > 0:
+            bar_range = bar.high - bar.low
+            if bar_range > 0:
+                if signal == "LONG":
+                    close_ratio = (close - bar.low) / bar_range
+                    if close_ratio < self.config.min_bar_close_ratio:
+                        reason = (f"WEAK_BAR_CLOSE (ratio={close_ratio:.2f} < "
+                                  f"{self.config.min_bar_close_ratio:.2f}) — retrying")
+                        logger.info("%s | FILTER RETRY: %s", state.symbol, reason)
+                        await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
+                        return
+                else:
+                    close_ratio = (bar.high - close) / bar_range
+                    if close_ratio < self.config.min_bar_close_ratio:
+                        reason = (f"WEAK_BAR_CLOSE (ratio={close_ratio:.2f} < "
+                                  f"{self.config.min_bar_close_ratio:.2f}) — retrying")
+                        logger.info("%s | FILTER RETRY: %s", state.symbol, reason)
+                        await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
+                        return
+
         # ── Spread filter — transient; retry next bar ──────────────────────────
         spread_pct = await self._fetch_spread_pct(state.symbol)
         if self.config.max_spread_pct > 0 and spread_pct > self.config.max_spread_pct:
@@ -718,6 +980,20 @@ class ORBBot:
             logger.warning("%s | FILTER RETRY: %s", state.symbol, reason)
             await self.db.log_event("FILTER_RETRY", f"{state.symbol}: {reason}")
             return
+
+        # ── Max-chase / pullback-entry check ──────────────────────────────────
+        if max_chase_pct > 0:
+            boundary = state.range_high if signal == "LONG" else state.range_low
+            chase_pct = abs(close - boundary) / boundary * 100
+            if chase_pct > max_chase_pct:
+                state.awaiting_pullback  = True
+                state.pullback_signal    = signal
+                state.pullback_bars_left = self.config.pullback_bars
+                reason = (f"PULLBACK_WAIT (chase={chase_pct:.2f}% > {max_chase_pct:.2f}%, "
+                          f"waiting {self.config.pullback_bars} bars)")
+                logger.info("%s | %s", state.symbol, reason)
+                await self.db.log_event("PULLBACK_WAIT", f"{state.symbol}: {reason}")
+                return
 
         # All filters passed — atomically commit to SUBMITTING before any order I/O
         state.status = STATUS_SUBMITTING
@@ -732,20 +1008,21 @@ class ORBBot:
 
     # ── Analyst Filters ────────────────────────────────────────────────────────
 
-    async def _fetch_atr_pct(self, symbol: str, ref_price: float) -> float:
+    async def _fetch_atr_and_prev_close(self, symbol: str, ref_price: float) -> tuple:
+        """Returns (atr_pct, prev_close, hist_orb_vol). Any value is 0.0 on error."""
         try:
             loop = asyncio.get_running_loop()
             req  = StockBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=TimeFrame.Day,
-                start=datetime.now(timezone.utc) - timedelta(days=30),
+                start=datetime.now(timezone.utc) - timedelta(days=40),
                 end=datetime.now(timezone.utc)   - timedelta(days=1),
                 feed=self.config.data_feed,
             )
             resp = await loop.run_in_executor(None, lambda: self.historical_client.get_stock_bars(req))
             bars = resp[symbol]
             if len(bars) < 2:
-                return 0.0
+                return 0.0, 0.0, 0.0
             trs = [
                 max(
                     float(bars[i].high) - float(bars[i].low),
@@ -754,11 +1031,15 @@ class ORBBot:
                 )
                 for i in range(1, len(bars))
             ]
-            atr = sum(trs[-14:]) / min(14, len(trs))
-            return (atr / ref_price) * 100
+            atr        = sum(trs[-14:]) / min(14, len(trs))
+            atr_pct    = (atr / ref_price) * 100
+            prev_close = float(bars[-1].close)
+            avg_daily_vol = sum(float(b.volume) for b in bars[-20:]) / min(20, len(bars))
+            hist_orb_vol  = avg_daily_vol * (self.config.orb_minutes / 390.0) * self.config.orb_volume_factor
+            return atr_pct, prev_close, hist_orb_vol
         except Exception as exc:
             logger.warning("%s | ATR fetch failed (filter skipped): %s", symbol, exc)
-            return 0.0
+            return 0.0, 0.0, 0.0
 
     async def _fetch_spread_pct(self, symbol: str) -> float:
         try:
@@ -804,24 +1085,37 @@ class ORBBot:
         else:
             sl = round(state.range_low if signal == "LONG" else state.range_high, 2)
 
-        if signal == "LONG":
-            tp = round(entry_stop + orb_range * self.config.risk_ratio, 2)
+        now_est = datetime.now(self.config.tz)
+        h, m = now_est.hour, now_est.minute
+        if self.config.tp_taper:
+            if (h, m) >= (self.config.tp_taper_2_hour, self.config.tp_taper_2_min):
+                effective_ratio = self.config.risk_ratio * self.config.tp_taper_2_mult
+            elif (h, m) >= (self.config.tp_taper_1_hour, self.config.tp_taper_1_min):
+                effective_ratio = self.config.risk_ratio * self.config.tp_taper_1_mult
+            else:
+                effective_ratio = self.config.risk_ratio
         else:
-            tp = round(entry_stop - orb_range * self.config.risk_ratio, 2)
+            effective_ratio = self.config.risk_ratio
+
+        if signal == "LONG":
+            tp = round(entry_stop + orb_range * effective_ratio, 2)
+        else:
+            tp = round(entry_stop - orb_range * effective_ratio, 2)
 
         risk_per_share = abs(entry_stop - sl)
         if risk_per_share <= 0:
             state.status = STATUS_COMPLETED
             return
 
-        risk_dollar = self.starting_equity * self.config.risk_pct_equity / 100.0
+        equity      = self.current_equity if self.current_equity > 0 else self.starting_equity
+        risk_dollar = equity * self.config.risk_pct_equity / 100.0
         total_qty   = max(1, math.floor(risk_dollar / risk_per_share))
         if self.config.max_position_usd > 0:
             total_qty = min(total_qty, max(1, math.floor(self.config.max_position_usd / close)))
-        # Hard leverage cap: position value ≤ max_leverage_pct% of equity
+        # Hard leverage cap: position value ≤ max_leverage_pct% of current equity
         if self.config.max_leverage_pct > 0:
             max_pos_qty = max(1, math.floor(
-                self.starting_equity * self.config.max_leverage_pct / 100.0 / entry_stop
+                equity * self.config.max_leverage_pct / 100.0 / entry_stop
             ))
             total_qty = min(total_qty, max_pos_qty)
 
@@ -855,7 +1149,7 @@ class ORBBot:
                 qty=total_qty, take_profit=tp, stop_loss=sl,
                 order_id=state.order_id,
                 tp1_price=tp,
-                gap_pct=0.0, rvol=0.0,
+                gap_pct=state.day_gap_pct, rvol=0.0,
                 entry_vwap=entry_vwap,
             )
             state.trade_db_id = trade_id
@@ -889,6 +1183,7 @@ class ORBBot:
             logger.warning("Kill-switch check failed: %s", exc)
             return
 
+        self.current_equity = current_equity
         if self.starting_equity <= 0:
             return
         loss_pct = (self.starting_equity - current_equity) / self.starting_equity * 100
@@ -1028,15 +1323,80 @@ class ORBBot:
         </div>"""
         await self._send_email(f"[ORB {mode}] EOD Summary {today} | PnL ${total_pnl:+.2f}", html)
 
-        for state in self.states.values():
+        loop = asyncio.get_running_loop()
+        for symbol, state in self.states.items():
+            async with state.lock:
+                if state.status != STATUS_IN_TRADE:
+                    continue
+                order_id    = state.order_id
+                trade_db_id = state.trade_db_id
+                entry_price = state.entry_price
+                side        = state.side
+                qty_filled  = state.entry_qty_filled or state.entry_qty_requested
+
+            db_status  = "CLOSED_MANUAL"
+            exit_price = None
+            pnl        = None
+            if order_id:
+                try:
+                    o = await loop.run_in_executor(
+                        None, lambda oid=order_id: self.trading_client.get_order_by_id(oid)
+                    )
+                    # First try: bracket leg hit TP or SL before the flatten
+                    for leg in (o.legs or []):
+                        if str(getattr(leg, "status", "")).lower() != "filled":
+                            continue
+                        leg_type   = str(getattr(leg, "order_type", "")).lower()
+                        exit_price = round(float(leg.filled_avg_price), 4)
+                        db_status  = "CLOSED_TP" if "limit" in leg_type else "CLOSED_SL"
+                        if entry_price and qty_filled > 0:
+                            pnl = round(
+                                (exit_price - entry_price) * qty_filled if side == "LONG"
+                                else (entry_price - exit_price) * qty_filled, 2,
+                            )
+                        break
+                except Exception:
+                    pass
+
+            # Second try: position closed by EOD flatten — find the market close order
+            if exit_price is None:
+                try:
+                    close_side = "sell" if side == "LONG" else "buy"
+                    req = GetOrdersRequest(
+                        symbols=[symbol], status="closed",
+                        after=datetime.now(timezone.utc) - timedelta(minutes=15),
+                    )
+                    recent = await loop.run_in_executor(
+                        None, lambda r=req: self.trading_client.get_orders(r)
+                    )
+                    for co in recent:
+                        if (str(getattr(co, "order_type", "")).lower() == "market"
+                                and str(getattr(co, "side", "")).lower() == close_side
+                                and str(getattr(co, "status", "")).lower() == "filled"
+                                and co.filled_avg_price):
+                            exit_price = round(float(co.filled_avg_price), 4)
+                            db_status  = "CLOSED_EOD"
+                            if entry_price and qty_filled > 0:
+                                pnl = round(
+                                    (exit_price - entry_price) * qty_filled if side == "LONG"
+                                    else (entry_price - exit_price) * qty_filled, 2,
+                                )
+                            break
+                except Exception as exc:
+                    logger.warning("%s | EOD close-order lookup failed: %s", symbol, exc)
+
             async with state.lock:
                 if state.status == STATUS_IN_TRADE:
                     state.status = STATUS_COMPLETED
-                    if state.trade_db_id:
-                        await self.db.update_trade(
-                            state.trade_db_id, status="CLOSED_MANUAL",
-                            closed_at=datetime.now(timezone.utc).isoformat(),
-                        )
+                    if trade_db_id:
+                        upd = dict(status=db_status,
+                                   closed_at=datetime.now(timezone.utc).isoformat())
+                        if exit_price is not None:
+                            upd["exit_price"] = exit_price
+                        if pnl is not None:
+                            upd["realized_pnl"] = pnl
+                        await self.db.update_trade(trade_db_id, **upd)
+
         await self.db.log_event("EOD_FLATTEN", "All positions flattened")
 
     # ── Background Tasks ───────────────────────────────────────────────────────
@@ -1085,10 +1445,13 @@ class ORBBot:
                             continue
                         leg_type   = str(getattr(leg, "order_type", "")).lower()
                         fill_price = round(float(leg.filled_avg_price), 4)
-                        entry      = state.entry_price or fill_price
+                        entry      = state.entry_price or (
+                            round(float(o.filled_avg_price), 4) if o.filled_avg_price else fill_price
+                        )
+                        actual_qty = filled if filled > 0 else prev_filled
                         pnl        = round(
-                            (fill_price - entry) * qty_req if state.side == "LONG"
-                            else (entry - fill_price) * qty_req,
+                            (fill_price - entry) * actual_qty if state.side == "LONG"
+                            else (entry - fill_price) * actual_qty,
                             2,
                         )
 
@@ -1135,6 +1498,7 @@ class ORBBot:
                     entry_price = state.entry_price
                     side        = state.side
                     qty_req     = state.entry_qty_requested
+                    qty_filled  = state.entry_qty_filled or state.entry_qty_requested
 
                 try:
                     try:
@@ -1172,8 +1536,8 @@ class ORBBot:
                                 leg_type   = str(getattr(leg, "order_type", "")).lower()
                                 exit_price = round(float(leg.filled_avg_price), 4)
                                 realized_pnl = round(
-                                    (exit_price - entry_price) * qty_req if side == "LONG"
-                                    else (entry_price - exit_price) * qty_req,
+                                    (exit_price - entry_price) * qty_filled if side == "LONG"
+                                    else (entry_price - exit_price) * qty_filled,
                                     2,
                                 )
                                 db_status = "CLOSED_TP" if "limit" in leg_type else "CLOSED_SL"
@@ -1300,21 +1664,24 @@ class ORBBot:
     async def _seed_range_from_bars(self, symbol: str, state: "TickerState"):
         """Load today's ORB bars from DB and set state to SCANNING if range is valid."""
         try:
-            today = datetime.now(self.config.tz).strftime("%Y-%m-%d")
-            orb_end_min = 30 + self.config.orb_minutes
-            rows = await self.db.fetch_orb_bars(symbol, today, orb_end_min)
+            today         = datetime.now(self.config.tz).strftime("%Y-%m-%d")
+            now_est       = datetime.now(self.config.tz)
+            orb_start_est = now_est.replace(hour=9, minute=30, second=0, microsecond=0)
+            orb_end_est   = orb_start_est + timedelta(minutes=self.config.orb_minutes)
+            orb_start_utc = orb_start_est.astimezone(timezone.utc).strftime("%H:%M:%S")
+            orb_end_utc   = orb_end_est.astimezone(timezone.utc).strftime("%H:%M:%S")
+            rows = await self.db.fetch_orb_bars(symbol, today, orb_start_utc, orb_end_utc)
             if len(rows) < max(1, self.config.orb_minutes * 6 // 10):
                 return
             highs  = [r["high"]   for r in rows]
             lows   = [r["low"]    for r in rows]
             vols   = [float(r["volume"]) for r in rows]
-            closes = [r["close"]  for r in rows]
             state.range_high     = max(highs)
             state.range_low      = min(lows)
             state.range_mid      = (state.range_high + state.range_low) / 2
             state.avg_orb_volume = sum(vols) / len(vols)
             # Reconstruct VWAP from all bars in DB for today
-            all_rows = await self.db.fetch_all_bars_today(symbol, today)
+            all_rows = await self.db.fetch_all_bars_today(symbol, today, orb_start_utc)
             for r in all_rows:
                 typical = (r["high"] + r["low"] + r["close"]) / 3.0
                 state.vwap_num += typical * float(r["volume"])
@@ -1366,24 +1733,49 @@ class ORBBot:
         if not self.kill_switch_triggered:
             logger.info("Auto-flatten triggered (3:55 PM EST)")
             await self._flatten_all_positions(reason="AUTO_FLATTEN_3:55PM")
+            await asyncio.sleep(8)  # let market-close orders fill before capturing PnL
         today = datetime.now(self.config.tz).strftime("%Y-%m-%d")
         await self._email_eod_summary(today)
 
     # ── Stream with Reconnection ───────────────────────────────────────────────
 
     async def _run_stream_with_reconnect(self):
+        """
+        Run the Alpaca WebSocket stream with exponential back-off on failure.
+
+        The alpaca-py library's _run_forever() loops internally on ValueError
+        (e.g. "connection limit exceeded") with zero sleep and never returns.
+        We run it as a cancellable task, poll for auth success after a short
+        grace period, and cancel the task ourselves if the connection was never
+        established — then our own backoff timer kicks in.
+        """
         backoff = 5
         while not self.kill_switch_triggered:
-            try:
-                logger.info("Connecting to Alpaca data stream…")
-                await self.stream._run_forever()
-                logger.warning("Stream ended — reconnecting…")
-                backoff = 5  # clean disconnect → reset backoff
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error("Stream error: %s", exc)
-                # Do NOT reset backoff on error — let it grow so we stop hammering Alpaca
+            logger.info("Connecting to Alpaca data stream…")
+            stream_task = asyncio.create_task(self.stream._run_forever())
+
+            # Give the library up to 6 s to authenticate and set _running=True.
+            # If it hasn't connected by then it's stuck in its internal retry loop.
+            await asyncio.sleep(6)
+
+            if self.stream._running:
+                # Connection established — wait for it to drop naturally.
+                try:
+                    await stream_task
+                    logger.warning("Stream ended — reconnecting…")
+                    backoff = 5  # clean disconnect → reset
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error("Stream error: %s", exc)
+            else:
+                # Never connected — cancel the spinning task and back off.
+                stream_task.cancel()
+                try:
+                    await stream_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                logger.warning("Stream failed to authenticate — backing off %ds", backoff)
 
             if self.kill_switch_triggered:
                 break
@@ -1428,10 +1820,17 @@ class ORBBot:
             if row is None:
                 continue
 
-            # Reconstruct VWAP and avg_orb_volume from price_bars
-            all_bars  = await self.db.fetch_all_bars_today(symbol, today)
-            orb_end_m = 30 + self.config.orb_minutes
-            orb_bars  = await self.db.fetch_orb_bars(symbol, today, orb_end_m)
+            # Reconstruct VWAP, avg_orb_volume, and filter fields from price_bars
+            orb_start_est = now_est.replace(hour=9, minute=30, second=0, microsecond=0)
+            orb_end_est   = orb_start_est + timedelta(minutes=self.config.orb_minutes)
+            orb_start_utc = orb_start_est.astimezone(timezone.utc).strftime("%H:%M:%S")
+            orb_end_utc   = orb_end_est.astimezone(timezone.utc).strftime("%H:%M:%S")
+            all_bars = await self.db.fetch_all_bars_today(symbol, today, orb_start_utc)
+            orb_bars = await self.db.fetch_orb_bars(symbol, today, orb_start_utc, orb_end_utc)
+            # Fetch ATR/prev_close to restore gap% and hist_orb_vol (outside the lock)
+            atr_pct, prev_close, hist_orb_vol = await self._fetch_atr_and_prev_close(
+                symbol, row["range_high"]
+            )
 
             async with state.lock:
                 if state.status != STATUS_WAITING:
@@ -1447,13 +1846,27 @@ class ORBBot:
                     typical = (r["high"] + r["low"] + r["close"]) / 3.0
                     state.vwap_num += typical * float(r["volume"])
                     state.vwap_den += float(r["volume"])
+                # Restore filter fields so gap/first-bar/rvol filters work after restart
+                state.hist_orb_vol = hist_orb_vol
+                if prev_close > 0:
+                    state.day_gap_pct = round(
+                        (row["range_mid"] - prev_close) / prev_close * 100, 2
+                    )
+                if orb_bars:
+                    fb = orb_bars[0]
+                    if fb.get("open") is not None:
+                        if fb["close"] > fb["open"]:
+                            state.first_bar_bias = "LONG"
+                        elif fb["close"] < fb["open"]:
+                            state.first_bar_bias = "SHORT"
                 state.status = STATUS_SCANNING
 
             logger.info(
-                "%s | Startup: range seeded from DB — H=%.2f L=%.2f AvgVol=%.0f VWAP=%.3f",
+                "%s | Startup: range seeded from DB — H=%.2f L=%.2f AvgVol=%.0f VWAP=%.3f gap=%.1f%%",
                 symbol, row["range_high"], row["range_low"],
                 state.avg_orb_volume,
                 state.vwap_num / state.vwap_den if state.vwap_den > 0 else 0,
+                state.day_gap_pct,
             )
 
     # ── Entry Point ────────────────────────────────────────────────────────────
@@ -1464,6 +1877,7 @@ class ORBBot:
 
         await self.db.initialize()
         await self._fetch_starting_equity()
+        await self._fetch_spy_bias()
         await self.db.log_event("START", f"universe={self.config.symbols}")
 
         await self._resume_from_db()
@@ -1494,7 +1908,20 @@ PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.pid")
 
 
 def main():
-    # Write PID so the dashboard can restart us cleanly
+    # Kill any previous instance before writing our PID
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE) as _f:
+                old_pid = int(_f.read().strip())
+            import subprocess
+            subprocess.call(
+                ["taskkill", "/F", "/PID", str(old_pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            logger.info("Killed previous bot instance (PID %d)", old_pid)
+        except Exception as exc:
+            logger.warning("Could not kill previous instance: %s", exc)
+
     with open(PID_FILE, "w") as _f:
         _f.write(str(os.getpid()))
 

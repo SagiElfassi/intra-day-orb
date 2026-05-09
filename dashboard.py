@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from alpaca.data.enums import DataFeed
 from dotenv import load_dotenv
 from plotly.subplots import make_subplots
 from zoneinfo import ZoneInfo
@@ -628,6 +629,11 @@ def render_trade_card(trade: pd.Series, current_price: float | None):
 def build_equity_curve(
     trades_df: pd.DataFrame,
     benchmark_df: pd.DataFrame | None = None,
+    mode: str = "pnl",                    # "pnl" = dollar P&L | "pct" = % return
+    starting_equity: float = 100_000.0,
+    equity_curve: list | None = None,      # pre-built from BacktestResult
+    spy_equity_curve: list | None = None,  # daily SPY portfolio values
+    spy_dates: list | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     if trades_df.empty:
@@ -637,38 +643,103 @@ def build_equity_curve(
         fig.update_layout(height=300)
         return fig
 
-    x = list(range(1, len(trades_df) + 1))
-    y = trades_df["pnl"].cumsum().tolist()
+    n = len(trades_df)
+    trade_date_strs = trades_df["date"].astype(str).tolist()
 
+    # ── Per-trade equity sequence ────────────────────────────────────────────
+    if equity_curve and len(equity_curve) == n + 1:
+        orb_abs_seq = list(equity_curve)
+    else:
+        orb_abs_seq = [starting_equity] + [
+            starting_equity + v for v in trades_df["pnl"].cumsum().tolist()
+        ]
+
+    # Last post-trade equity per date (handles multiple trades on same day)
+    trade_eq_map: dict = {}
+    for d, v in zip(trade_date_strs, orb_abs_seq[1:]):
+        trade_eq_map[d] = v
+
+    # ── SPY data ─────────────────────────────────────────────────────────────
+    spy_abs_by_date: dict = {}
+    if spy_equity_curve and spy_dates:
+        spy_abs_by_date = dict(zip(spy_dates, spy_equity_curve))
+    elif benchmark_df is not None and not benchmark_df.empty:
+        spy_abs_by_date = {
+            str(row["date"]): starting_equity + row["benchmark_pnl"]
+            for _, row in benchmark_df.iterrows()
+        }
+
+    # ── Unified date axis: all SPY days + all trade days, sorted ─────────────
+    all_dates = sorted(set(spy_abs_by_date.keys()) | set(trade_date_strs))
+    if not all_dates:
+        all_dates = sorted(trade_date_strs)
+
+    # ── ORB daily equity: flat on no-trade days ───────────────────────────────
+    cur = starting_equity
+    daily_orb_abs = []
+    for d in all_dates:
+        if d in trade_eq_map:
+            cur = trade_eq_map[d]
+        daily_orb_abs.append(cur)
+
+    def _to_y(abs_vals):
+        if mode == "pct":
+            return [round((v / starting_equity - 1) * 100, 4) for v in abs_vals]
+        return [v - starting_equity for v in abs_vals]
+
+    if mode == "pct":
+        y_label = "Return (%)"
+        h_orb   = "%{x}<br>ORB: %{y:.2f}%<extra></extra>"
+        h_spy   = "%{x}<br>SPY B&H: %{y:.2f}%<extra></extra>"
+    else:
+        y_label = "Cumulative P&L ($)"
+        h_orb   = "%{x}<br>ORB: $%{y:,.2f}<extra></extra>"
+        h_spy   = "%{x}<br>SPY B&H: $%{y:,.2f}<extra></extra>"
+
+    orb_y_line = _to_y(daily_orb_abs)
+
+    # Continuous line through all dates (no markers)
     fig.add_trace(go.Scatter(
-        x=x, y=y, mode="lines+markers",
+        x=all_dates, y=orb_y_line, mode="lines",
         line=dict(color="#82b1ff", width=2),
-        fill="tozeroy",
-        fillcolor="rgba(130,177,255,0.1)",
+        fill="tozeroy", fillcolor="rgba(130,177,255,0.1)",
         name="ORB Strategy",
-        hovertemplate="Trade %{x}<br>ORB: $%{y:.2f}<extra></extra>",
+        hovertemplate=h_orb,
+    ))
+    # Markers only on trade dates
+    marker_x = [d for d in trade_date_strs if d in trade_eq_map]
+    marker_y = _to_y([trade_eq_map[d] for d in marker_x])
+    fig.add_trace(go.Scatter(
+        x=marker_x, y=marker_y, mode="markers",
+        marker=dict(color="#82b1ff", size=6, line=dict(color="#ffffff", width=1)),
+        name="Trade exit",
+        hovertemplate=h_orb,
+        showlegend=False,
     ))
 
-    if benchmark_df is not None and not benchmark_df.empty:
-        bench_by_date = dict(zip(benchmark_df["date"], benchmark_df["benchmark_pnl"]))
-        sorted_dates  = sorted(bench_by_date.keys())
-        bench_y = []
-        for td in trades_df["date"].tolist():
-            td_str = str(td)
-            candidates = [d for d in sorted_dates if d <= td_str]
-            bench_y.append(bench_by_date[candidates[-1]] if candidates else None)
+    # ── SPY baseline ─────────────────────────────────────────────────────────
+    if spy_abs_by_date:
+        sorted_spy = sorted(spy_abs_by_date.keys())
+        spy_y_line = []
+        for d in all_dates:
+            candidates = [sd for sd in sorted_spy if sd <= d]
+            abs_val = spy_abs_by_date[candidates[-1]] if candidates else starting_equity
+            spy_y_line.append(abs_val)
         fig.add_trace(go.Scatter(
-            x=x, y=bench_y,
-            mode="lines",
+            x=all_dates, y=_to_y(spy_y_line), mode="lines",
             line=dict(color="#FFD700", width=1.5, dash="dot"),
             name="SPY Buy & Hold",
-            hovertemplate="Trade %{x}<br>SPY B&H: $%{y:.2f}<extra></extra>",
+            hovertemplate=h_spy,
         ))
 
+    fig.add_hline(y=0.0, line_color="#546e7a", line_width=1, line_dash="solid")
+
+    title = "Equity Curve vs SPY Buy & Hold" + (" — % Return" if mode == "pct" else " — $ P&L")
     fig.update_layout(
-        title="Equity Curve vs SPY Buy & Hold", height=300,
-        xaxis_title="Trade #", yaxis_title="Cumulative P&L ($)",
-        margin=dict(l=0, r=0, t=40, b=0),
+        title=title, height=320,
+        xaxis_title="Date", yaxis_title=y_label,
+        xaxis=dict(type="category", tickangle=-45, nticks=20),
+        margin=dict(l=0, r=0, t=40, b=40),
         legend=dict(orientation="h", y=1.15, x=0),
     )
     _dark_layout(fig)
@@ -707,9 +778,12 @@ def build_bt_day_chart(trade_row: pd.Series, day_bars: pd.DataFrame) -> go.Figur
 
     day_bars = trading_hours(day_bars).copy()
 
-    typ_px  = (day_bars["high"] + day_bars["low"] + day_bars["close"]) / 3
-    cum_vol = day_bars["volume"].cumsum()
-    day_bars["_vwap"] = (typ_px * day_bars["volume"]).cumsum() / cum_vol.replace(0, float("nan"))
+    vwap_bars = day_bars[day_bars["timestamp"].dt.time >= pd.Timestamp("09:30").time()].copy()
+    if not vwap_bars.empty:
+        typ_px  = (vwap_bars["high"] + vwap_bars["low"] + vwap_bars["close"]) / 3
+        cum_vol = vwap_bars["volume"].cumsum()
+        vwap_bars["_vwap"] = (typ_px * vwap_bars["volume"]).cumsum() / cum_vol.replace(0, float("nan"))
+        day_bars = day_bars.merge(vwap_bars[["timestamp", "_vwap"]], on="timestamp", how="left")
 
     fig.add_trace(go.Candlestick(
         x=day_bars["timestamp"],
@@ -749,7 +823,8 @@ def build_bt_day_chart(trade_row: pd.Series, day_bars: pd.DataFrame) -> go.Figur
 
     entry   = trade_row["entry_price"]
     sl      = trade_row["stop_loss"]
-    tp_px   = trade_row.get("take_profit", 0.0) or trade_row.get("tp1_price", 0.0) or 0.0
+    tp1_px  = trade_row.get("tp1_price") or 0.0
+    tp2_px  = trade_row.get("take_profit") or 0.0
 
     fig.add_hline(y=entry, line_dash="solid", line_color="#82b1ff", line_width=1.5,
                   annotation_text=f"Entry  {entry:.2f}", annotation_position="right",
@@ -757,15 +832,28 @@ def build_bt_day_chart(trade_row: pd.Series, day_bars: pd.DataFrame) -> go.Figur
     fig.add_hline(y=sl, line_dash="dash", line_color="#ef5350", line_width=1.5,
                   annotation_text=f"SL  {sl:.2f}", annotation_position="right",
                   annotation_font_color="#ef5350")
-    if tp_px:
-        fig.add_hline(y=tp_px, line_dash="dash", line_color="#00e676", line_width=1.5,
-                      annotation_text=f"TP  {tp_px:.2f}", annotation_position="right",
+    if tp1_px and tp2_px and tp1_px != tp2_px:
+        fig.add_hline(y=tp1_px, line_dash="dot", line_color="#69f0ae", line_width=1.2,
+                      annotation_text=f"TP1  {tp1_px:.2f}", annotation_position="right",
+                      annotation_font_color="#69f0ae")
+        fig.add_hline(y=tp2_px, line_dash="dash", line_color="#00e676", line_width=1.5,
+                      annotation_text=f"TP2  {tp2_px:.2f}", annotation_position="right",
+                      annotation_font_color="#00e676")
+    elif tp2_px:
+        fig.add_hline(y=tp2_px, line_dash="dash", line_color="#00e676", line_width=1.5,
+                      annotation_text=f"TP  {tp2_px:.2f}", annotation_position="right",
+                      annotation_font_color="#00e676")
+    elif tp1_px:
+        fig.add_hline(y=tp1_px, line_dash="dash", line_color="#00e676", line_width=1.5,
+                      annotation_text=f"TP  {tp1_px:.2f}", annotation_position="right",
                       annotation_font_color="#00e676")
 
     _exit_colors = {
         "TP": "#00e676", "CLOSED_TP": "#00e676",
+        "TP1+TP2": "#00e676", "TP1+BE": "#69f0ae",
+        "TP1+EOD": "#FFB300", "TP1+SL": "#ef9a9a",
         "SL": "#ef5350", "CLOSED_SL": "#ef5350",
-        "EOD": "#FF6F00",
+        "EOD": "#FF6F00", "FB": "#90a4ae",
     }
     exit_reason = trade_row.get("exit_reason", "")
 
@@ -785,6 +873,19 @@ def build_bt_day_chart(trade_row: pd.Series, day_bars: pd.DataFrame) -> go.Figur
         ))
     except Exception:
         pass
+
+    leg1_reason = trade_row.get("leg1_exit_reason", "")
+    if leg1_reason == "TP1" and pd.notna(trade_row.get("tp1_price")) and pd.notna(trade_row.get("entry_time")):
+        try:
+            fig.add_trace(go.Scatter(
+                x=[entry_ts], y=[float(trade_row["tp1_price"])],
+                mode="markers",
+                marker=dict(symbol="circle-open", size=10, color="#69f0ae", line_width=2),
+                name="TP1 Fill",
+                hovertemplate=f"TP1 Fill<br>$%{{y:.2f}}<extra></extra>",
+            ))
+        except Exception:
+            pass
 
     if pd.notna(trade_row.get("exit_time")) and pd.notna(trade_row.get("exit_price")):
         try:
@@ -1144,9 +1245,102 @@ with _r2c6:
     ).strip()
     try:
         _leh, _lem = [int(x) for x in last_entry_time.split(":")]
+        if not (9 <= _leh <= 15 and 0 <= _lem <= 59):
+            raise ValueError("out of range")
     except Exception:
         _leh, _lem = 11, 0
         last_entry_time = "11:00"
+
+with st.expander("⚙️ Advanced Filters", expanded=False):
+    _adv1, _adv2, _adv3, _adv4, _adv5 = st.columns(5)
+    with _adv1:
+        gap_direction_filter = st.toggle(
+            "Gap Direction", value=bool(cfg.get("gap_direction_filter", False)), key="adv_gap_dir",
+            help="Only take signals aligned with pre-market gap direction",
+        )
+        gap_min_pct = st.number_input(
+            "Min Gap %", 0.1, 20.0, float(cfg.get("gap_min_pct", 0.5)), 0.1, format="%.1f", key="adv_gap_min",
+            help="Minimum absolute gap % to activate the gap direction filter",
+        )
+    with _adv2:
+        spy_filter = st.toggle(
+            "SPY Trend Filter", value=bool(cfg.get("spy_filter", False)), key="adv_spy",
+            help="Only LONG when SPY > 20-day SMA; only SHORT when below",
+        )
+        first_bar_filter = st.toggle(
+            "First-Bar Filter", value=bool(cfg.get("first_bar_filter", False)), key="adv_fb",
+            help="Only take signals matching the direction of the first ORB candle",
+        )
+    with _adv3:
+        min_breakout_strength_pct = st.number_input(
+            "Breakout Strength %", 0.0, 2.0, float(cfg.get("min_breakout_strength_pct", 0.0)), 0.05,
+            format="%.2f", key="adv_bk_str",
+            help="Close must extend this % beyond the ORB boundary. 0 = disabled.",
+        )
+        min_bar_close_ratio = st.number_input(
+            "Bar Close Ratio", 0.0, 1.0, float(cfg.get("min_bar_close_ratio", 0.0)), 0.05,
+            format="%.2f", key="adv_bcr",
+            help="For LONG: close must be in top X fraction of bar's range. 0 = disabled.",
+        )
+    with _adv4:
+        rvol_mult = st.number_input(
+            "Hist RVOL ×", 0.0, 5.0, float(cfg.get("rvol_mult", 0.0)), 0.1, format="%.1f", key="adv_rvol",
+            help="Breakout bar volume ≥ N × 20-day avg ORB-window volume. 0 = disabled.",
+        )
+        max_gap_abs_pct = st.number_input(
+            "Max Gap % (earnings)", 0.0, 50.0, float(cfg.get("max_gap_abs_pct", 0.0)), 1.0,
+            format="%.0f", key="adv_max_gap",
+            help="Skip days where absolute gap > this %. Use ~10% to filter earnings. 0 = disabled.",
+        )
+    with _adv5:
+        min_range_pct = st.number_input(
+            "Min ORB Range %", 0.0, 5.0, float(cfg.get("min_range_pct", 0.0)), 0.1,
+            format="%.1f", key="adv_min_rng",
+            help="Skip if ORB range < this % of price (too tight). 0 = disabled.",
+        )
+        max_range_pct = st.number_input(
+            "Max ORB Range %", 0.0, 20.0, float(cfg.get("max_range_pct", 0.0)), 0.5,
+            format="%.1f", key="adv_max_rng",
+            help="Skip if ORB range > this % of price (too wide / chaotic). 0 = disabled.",
+        )
+
+    _adv6, _adv7, _adv8, _adv9, _adv10 = st.columns(5)
+    with _adv6:
+        failed_breakout_exit = st.toggle(
+            "Failed-Breakout Exit", value=bool(cfg.get("failed_breakout_exit", False)), key="adv_fbo",
+            help="Exit when price closes back inside the ORB after entry",
+        )
+        tp_taper = st.toggle(
+            "TP Taper (late entries)", value=bool(cfg.get("tp_taper", False)), key="adv_tp_taper",
+            help="Reduce TP target for signals fired after 10:15 / 10:45 AM",
+        )
+    with _adv7:
+        max_chase_pct = st.number_input(
+            "Max Chase %", 0.0, 5.0, float(cfg.get("max_chase_pct", 0.0)), 0.1,
+            format="%.1f", key="adv_chase",
+            help="Wait for pullback if breakout bar is > this % beyond ORB boundary. 0 = disabled.",
+        )
+        pullback_bars = st.number_input(
+            "Pullback Window (bars)", 1, 10, int(cfg.get("pullback_bars", 3)), 1, key="adv_pb_bars",
+            help="Number of bars to wait for a pullback fill.",
+        )
+    with _adv8:
+        max_leverage_pct = st.number_input(
+            "Max Leverage %", 0.0, 100.0, float(cfg.get("max_leverage_pct", 25.0)), 1.0,
+            format="%.0f", key="adv_lev",
+            help="Hard cap on position value as % of account equity. 0 = unlimited.",
+        )
+        atr_sl_mult = st.number_input(
+            "ATR SL Mult", 0.5, 5.0, float(cfg.get("atr_sl_mult", 1.5)), 0.1,
+            format="%.1f", key="adv_atr_sl",
+            help="Stop-loss distance = ATR × this multiplier (only when Stop-Loss = ATR).",
+        )
+    with _adv9:
+        entry_limit_offset_pct = st.number_input(
+            "Entry Limit Offset %", 0.0, 1.0, float(cfg.get("entry_limit_offset_pct", 0.005)) * 100,
+            0.005, format="%.3f", key="adv_elo",
+            help="Stop-limit order: limit price offset from stop price (%). E.g. 0.5 = 0.5% above stop.",
+        ) / 100.0
 
 st.html('</div>')
 
@@ -1166,6 +1360,27 @@ if _save_now:
         risk_ratio=float(risk_ratio),
         max_position_usd=int(max_position_usd),
         last_entry_time=last_entry_time,
+        # These must be saved as individual keys — bot reads them separately
+        trading_window_end_hour=_leh,
+        trading_window_end_minute=_lem,
+        # Advanced filters
+        gap_direction_filter=gap_direction_filter,
+        gap_min_pct=float(gap_min_pct),
+        spy_filter=spy_filter,
+        first_bar_filter=first_bar_filter,
+        min_breakout_strength_pct=float(min_breakout_strength_pct),
+        min_bar_close_ratio=float(min_bar_close_ratio),
+        rvol_mult=float(rvol_mult),
+        max_gap_abs_pct=float(max_gap_abs_pct),
+        min_range_pct=float(min_range_pct),
+        max_range_pct=float(max_range_pct),
+        failed_breakout_exit=failed_breakout_exit,
+        tp_taper=tp_taper,
+        max_chase_pct=float(max_chase_pct),
+        pullback_bars=int(pullback_bars),
+        max_leverage_pct=float(max_leverage_pct),
+        atr_sl_mult=float(atr_sl_mult),
+        entry_limit_offset_pct=float(entry_limit_offset_pct),
     )
     save_config(new_cfg)
     cfg = new_cfg
@@ -1364,11 +1579,19 @@ with tab_live:
 # Backtest-only params: symbol, date range, slippage, starting equity.
 
 with tab_bt:
+    _adv_parts = [p for p in [
+        f"SPY={'on' if spy_filter else 'off'}",
+        f"GapDir={'on' if gap_direction_filter else 'off'}",
+        f"RVOL={rvol_mult:.1f}×" if rvol_mult > 0 else None,
+        f"Chase={max_chase_pct:.1f}%" if max_chase_pct > 0 else None,
+        f"FB={'on' if failed_breakout_exit else 'off'}",
+    ] if p]
     st.caption(
-        f"All strategy rules are applied: ORB={orb_minutes} min · SL={sl_type} · "
+        f"All settings bar filters applied — ORB={orb_minutes} min · SL={sl_type} · "
         f"VWAP={'on' if vwap_filter else 'off'} · Surge={volume_surge_mult:.1f}× · "
         f"Min ORB Vol={min_orb_volume//1000:,}K · Min ATR={min_atr_pct:.1f}% · "
-        f"TP={risk_ratio:.2f}R · Risk {risk_pct_equity:.1f}% equity"
+        f"TP={risk_ratio:.2f}R · Risk {risk_pct_equity:.1f}% · "
+        + " · ".join(_adv_parts)
     )
 
     bc1, bc2, bc3 = st.columns(3)
@@ -1382,7 +1605,59 @@ with tab_bt:
         bt_equity = st.number_input("Starting Equity ($)", 1_000, 10_000_000, 5_000, 1_000, key="bt_equity")
         st.caption("Filters and targets come from the settings bar above.")
 
-    run_btn = st.button("▶  Run Backtest", type="primary")
+    _feed_col, _ = st.columns([1, 3])
+    with _feed_col:
+        bt_feed = st.radio(
+            "Data Feed", ["IEX", "SIP"], index=0, key="bt_feed",
+            help="IEX = free tier (may have gaps). SIP = full tape (paid).",
+        )
+
+    _rb1, _rb2 = st.columns([1, 1])
+    with _rb1:
+        run_btn = st.button("▶  Run Backtest", type="primary", use_container_width=True)
+    with _rb2:
+        port_btn = st.button(
+            f"▶  Run Portfolio  ({', '.join(symbols[:3])}{'…' if len(symbols) > 3 else ''})",
+            type="secondary", use_container_width=True,
+            help="Backtest all symbols in the watchlist simultaneously and combine results",
+        )
+
+    def _build_backtest_kwargs():
+        return dict(
+            orb_minutes                 = orb_minutes,
+            stop_loss_type              = sl_type,
+            slippage_bps                = bt_slippage,
+            feed                        = DataFeed.SIP if bt_feed == "SIP" else DataFeed.IEX,
+            risk_ratio                  = risk_ratio,
+            risk_pct_equity             = risk_pct_equity,
+            starting_equity             = float(bt_equity),
+            vwap_filter                 = vwap_filter,
+            volume_surge_mult           = volume_surge_mult,
+            min_orb_volume              = min_orb_volume,
+            min_atr_pct                 = min_atr_pct,
+            max_position_usd            = float(max_position_usd),
+            max_leverage_pct            = float(max_leverage_pct),
+            atr_sl_mult                 = float(atr_sl_mult),
+            entry_limit_offset_pct      = float(entry_limit_offset_pct),
+            trading_window_end_hour     = _leh,
+            trading_window_end_minute   = _lem,
+            gap_direction_filter        = gap_direction_filter,
+            gap_min_pct                 = float(gap_min_pct),
+            first_bar_filter            = first_bar_filter,
+            spy_filter                  = spy_filter,
+            min_breakout_strength_pct   = float(min_breakout_strength_pct),
+            min_bar_close_ratio         = float(min_bar_close_ratio),
+            rvol_mult                   = float(rvol_mult),
+            max_gap_abs_pct             = float(max_gap_abs_pct),
+            min_range_pct               = float(min_range_pct),
+            max_range_pct               = float(max_range_pct),
+            failed_breakout_exit        = failed_breakout_exit,
+            tp_taper                    = tp_taper,
+            tp1_r                       = 0.0,
+            tp2_r                       = 0.0,
+            max_chase_pct               = float(max_chase_pct),
+            pullback_bars               = int(pullback_bars),
+        )
 
     if run_btn:
         if bt_start >= bt_end:
@@ -1393,27 +1668,13 @@ with tab_bt:
             if not api_key:
                 st.error("ALPACA_API_KEY not set. Add it to .env or environment.")
             else:
-                with st.spinner(f"Backtesting {bt_symbol}  {bt_start} → {bt_end}  [TP={risk_ratio:.2f}R]…"):
+                with st.spinner(f"Backtesting {bt_symbol}  {bt_start} → {bt_end}…"):
                     engine = BacktestEngine(api_key, api_secret)
                     result = engine.run_backtest(
-                        symbol                    = bt_symbol,
-                        start_date                = bt_start,
-                        end_date                  = bt_end,
-                        orb_minutes               = orb_minutes,
-                        stop_loss_type            = sl_type,
-                        slippage_bps              = bt_slippage,
-                        risk_ratio                = risk_ratio,
-                        risk_pct_equity           = risk_pct_equity,
-                        starting_equity           = float(bt_equity),
-                        vwap_filter               = vwap_filter,
-                        volume_surge_mult         = volume_surge_mult,
-                        min_orb_volume            = min_orb_volume,
-                        min_atr_pct               = min_atr_pct,
-                        max_position_usd          = float(max_position_usd),
-                        max_leverage_pct          = float(cfg.get("max_leverage_pct", 25.0)),
-                        atr_sl_mult               = cfg.get("atr_sl_mult", 1.5),
-                        trading_window_end_hour   = _leh,
-                        trading_window_end_minute = _lem,
+                        symbol     = bt_symbol,
+                        start_date = bt_start,
+                        end_date   = bt_end,
+                        **_build_backtest_kwargs(),
                     )
 
                 if result.error:
@@ -1421,8 +1682,38 @@ with tab_bt:
                 elif not result.trades:
                     st.warning("No trades generated. Try a wider date range or different symbol.")
                 else:
-                    st.session_state["bt_result"] = result
-                    st.session_state["bt_benchmark"] = fetch_spy_benchmark(
+                    st.session_state["bt_result"]       = result
+                    st.session_state["bt_per_symbol"]   = None
+                    st.session_state["bt_benchmark"]    = fetch_spy_benchmark(
+                        bt_start, bt_end, float(bt_equity), api_key, api_secret
+                    )
+
+    if port_btn:
+        if bt_start >= bt_end:
+            st.error("End date must be after start date.")
+        elif not symbols:
+            st.error("No symbols in watchlist. Add symbols in the top bar.")
+        else:
+            from backtest import BacktestEngine
+            api_key, api_secret = get_alpaca_credentials(alpaca_paper)
+            if not api_key:
+                st.error("ALPACA_API_KEY not set.")
+            else:
+                sym_label = ", ".join(symbols)
+                with st.spinner(f"Portfolio backtest: {sym_label}  {bt_start} → {bt_end}…"):
+                    engine = BacktestEngine(api_key, api_secret)
+                    portfolio_result, per_sym_results = engine.run_portfolio_backtest(
+                        symbols    = symbols,
+                        start_date = bt_start,
+                        end_date   = bt_end,
+                        **_build_backtest_kwargs(),
+                    )
+                if not portfolio_result.trades:
+                    st.warning("No trades generated across any symbol.")
+                else:
+                    st.session_state["bt_result"]       = portfolio_result
+                    st.session_state["bt_per_symbol"]   = per_sym_results
+                    st.session_state["bt_benchmark"]    = fetch_spy_benchmark(
                         bt_start, bt_end, float(bt_equity), api_key, api_secret
                     )
 
@@ -1437,12 +1728,15 @@ with tab_bt:
             f"|  {result.start_date} → {result.end_date}"
         )
 
+        _ret_pct = getattr(s, "total_return_pct", 0.0)
+        _dd_pct  = getattr(s, "max_drawdown_pct",  0.0)
+
         s1, s2, s3, s4, s5, s6 = st.columns(6)
         s1.metric("Total Trades",   s.total_trades)
         s2.metric("Win Rate",       f"{s.win_rate}%")
-        s3.metric("Total PnL",      f"${s.total_pnl:+.2f}")
+        s3.metric("Total PnL",      f"${s.total_pnl:+,.2f}", delta=f"{_ret_pct:+.2f}%")
         s4.metric("Profit Factor",  f"{s.profit_factor:.2f}" if s.profit_factor != float("inf") else "∞")
-        s5.metric("Max Drawdown",   f"-${s.max_drawdown:.2f}")
+        s5.metric("Max Drawdown",   f"-${s.max_drawdown:,.2f}", delta=f"-{_dd_pct:.2f}%", delta_color="inverse")
         s6.metric("Avg R",          f"{s.avg_r_multiple:.2f}R")
 
         sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
@@ -1465,11 +1759,29 @@ with tab_bt:
             for t in trades_list
         ])
 
-        benchmark_df = st.session_state.get("bt_benchmark")
+        benchmark_df   = st.session_state.get("bt_benchmark")
+        _eq_start      = getattr(result, "starting_equity",    100_000.0)
+        _eq_curve      = getattr(result, "equity_curve",       [])
+        _spy_eq_curve  = getattr(result, "spy_equity_curve",   [])
+        _spy_dates     = getattr(result, "spy_dates",          [])
 
         ch1, ch2 = st.columns([2, 1])
         with ch1:
-            st.plotly_chart(build_equity_curve(trades_df_bt, benchmark_df), use_container_width=True)
+            chart_mode = st.selectbox(
+                "Chart view", ["$ P&L", "% Return"],
+                key="bt_chart_mode", label_visibility="collapsed",
+            )
+            st.plotly_chart(
+                build_equity_curve(
+                    trades_df_bt, benchmark_df,
+                    mode            = "pct" if chart_mode == "% Return" else "pnl",
+                    starting_equity = _eq_start,
+                    equity_curve    = _eq_curve,
+                    spy_equity_curve= _spy_eq_curve,
+                    spy_dates       = _spy_dates,
+                ),
+                use_container_width=True,
+            )
         with ch2:
             st.plotly_chart(build_r_distribution(trades_df_bt), use_container_width=True)
 
@@ -1488,13 +1800,18 @@ with tab_bt:
         display["PnL"]   = display["pnl"].map(lambda x: f"+${x:.2f}" if x >= 0 else f"-${abs(x):.2f}")
         display["R"]     = display["r_multiple"].map(lambda x: f"+{x:.2f}R" if x >= 0 else f"{x:.2f}R")
         display["Fees"]  = display["fees"].map(lambda x: f"${x:.3f}")
-        show_cols = [
-            "#", "date", "Side", "entry_price", "take_profit", "stop_loss",
-            "exit_price", "Final", "qty", "PnL", "R", "Fees",
-        ]
+        _is_portfolio = st.session_state.get("bt_per_symbol") is not None
+        show_cols = (
+            ["#", "date", "symbol", "Side", "entry_price", "take_profit", "stop_loss",
+             "exit_price", "Final", "qty", "PnL", "R", "Fees"]
+            if _is_portfolio else
+            ["#", "date", "Side", "entry_price", "take_profit", "stop_loss",
+             "exit_price", "Final", "qty", "PnL", "R", "Fees"]
+        )
         col_cfg = {
             "#":            st.column_config.NumberColumn(width="small"),
             "date":         st.column_config.TextColumn("Date", width="small"),
+            "symbol":       st.column_config.TextColumn("Symbol", width="small"),
             "Side":         st.column_config.TextColumn(width="small"),
             "entry_price":  st.column_config.NumberColumn("Entry", format="$%.2f", width="small"),
             "take_profit":  st.column_config.NumberColumn("TP", format="$%.2f", width="small"),
@@ -1533,11 +1850,41 @@ with tab_bt:
                                  "Detail": st.column_config.TextColumn(width="large"),
                              })
 
+        # Per-symbol breakdown (portfolio mode only)
+        _per_sym = st.session_state.get("bt_per_symbol")
+        if _per_sym:
+            import statistics as _stats_mod
+            rows = []
+            for _r in _per_sym:
+                if _r.error or not _r.trades:
+                    rows.append({
+                        "Symbol": _r.symbol, "Trades": 0, "Win %": "—",
+                        "Total PnL": "—", "Expectancy": "—", "Sharpe": "—",
+                        "Best": "—", "Worst": "—",
+                    })
+                    continue
+                _s = _r.stats
+                rows.append({
+                    "Symbol":      _r.symbol,
+                    "Trades":      _s.total_trades,
+                    "Win %":       f"{_s.win_rate:.0f}%",
+                    "Total PnL":   f"${_s.total_pnl:+,.2f}",
+                    "Expectancy":  f"${_s.expectancy:.2f}",
+                    "Sharpe":      f"{_s.sharpe_ratio:.2f}",
+                    "Best":        f"${_s.best_trade:+,.2f}",
+                    "Worst":       f"${_s.worst_trade:+,.2f}",
+                })
+            with st.expander("📊 Per-Symbol Breakdown", expanded=True):
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
         st.subheader("Trade Detail")
         trade_idx = st.selectbox(
             "Select trade to inspect",
             options=list(range(len(trades_list))),
-            format_func=lambda i: f"#{i+1}  {trades_list[i].date}  {trades_list[i].side}  {trades_list[i].exit_reason}  ${trades_list[i].pnl:+.2f}",
+            format_func=lambda i: (
+                f"#{i+1}  {trades_list[i].date}  {trades_list[i].symbol}  "
+                f"{trades_list[i].side}  {trades_list[i].exit_reason}  ${trades_list[i].pnl:+.2f}"
+            ),
         )
         if trade_idx is not None:
             sel      = trades_list[trade_idx]
@@ -1559,7 +1906,7 @@ with tab_bt:
                 yr, mo, dy = map(int, d.split("-"))
                 return _BTE(_key, _sec).fetch_bars(sym, _date(yr, mo, dy), _date(yr, mo, dy))
 
-            day_bars = _get_day_bars(bt_symbol, sel_date, alpaca_paper)
+            day_bars = _get_day_bars(sel.symbol if sel.symbol else bt_symbol, sel_date, alpaca_paper)
             st.plotly_chart(
                 build_bt_day_chart(trades_df_bt.iloc[trade_idx], day_bars),
                 use_container_width=True,

@@ -229,6 +229,12 @@ class BacktestEngine:
         tp_taper_2_mult: float = 0.50,
         # Historical RVOL
         rvol_mult: float = 0.0,
+        # Signal quality: close must extend X% beyond ORB boundary (0 = disabled)
+        min_breakout_strength_pct: float = 0.0,
+        # Bar quality: close must be in top/bottom X fraction of bar's own range (0 = disabled)
+        min_bar_close_ratio: float = 0.0,
+        # Exit when price closes back inside ORB after entry (false-breakout cut)
+        failed_breakout_exit: bool = False,
     ) -> BacktestResult:
 
         result = BacktestResult(
@@ -286,10 +292,14 @@ class BacktestEngine:
         _atr_dollar_by_date = dict(zip(daily["_date"], daily["atr14"]))     # $ (for SL calc)
         _prev_close_by_date = dict(zip(daily["_date"], daily["prev_close"].fillna(0.0)))
 
-        # Historical RVOL: 20-day rolling average of daily volume scaled to ORB window
+        # Historical RVOL: 20-day rolling average of daily volume scaled to ORB window.
+        # Multiply by 3.5 to match bot.py (orb_volume_factor) — the opening period has
+        # ~3.5× per-minute volume vs the rest of the session.
+        _ORB_VOLUME_FACTOR = 3.5
         daily["hist_orb_vol"] = (
             daily["daily_volume"].rolling(20, min_periods=1).mean().shift(1)
             * (orb_minutes / 390.0)
+            * _ORB_VOLUME_FACTOR
         ).fillna(0.0)
         _hist_orb_vol_by_date = dict(zip(daily["_date"], daily["hist_orb_vol"]))
 
@@ -442,10 +452,13 @@ class BacktestEngine:
                     continue
 
             # ── Gap direction pre-filter ──────────────────────────────────────
+            # Use the first market-open bar's open price — matches bot.py which stores
+            # day_gap_pct = (state.bars[0].open - prev_close) / prev_close * 100
             prev_close_val = _prev_close_by_date.get(trade_date, 0.0)
             day_gap_pct = 0.0
             if prev_close_val > 0:
-                day_gap_pct = round((rng_mid_val - prev_close_val) / prev_close_val * 100, 2)
+                first_open = float(orb_bars.iloc[0]["open"])
+                day_gap_pct = round((first_open - prev_close_val) / prev_close_val * 100, 2)
 
             # ── Earnings / large-gap skip ─────────────────────────────────────
             if max_gap_abs_pct > 0 and abs(day_gap_pct) > max_gap_abs_pct:
@@ -481,6 +494,8 @@ class BacktestEngine:
             close_vals  = scan_bars["close"].values
             vwap_vals   = scan_bars["_vwap"].values
             volume_vals = scan_bars["volume"].values
+            high_vals   = scan_bars["high"].values
+            low_vals    = scan_bars["low"].values
 
             avg_orb_vol = orb_bars["volume"].mean() if not orb_bars.empty else 0.0
 
@@ -493,6 +508,8 @@ class BacktestEngine:
                 bar_close  = close_vals[i]
                 bar_vwap   = vwap_vals[i]
                 bar_volume = volume_vals[i]
+                bar_high   = high_vals[i]
+                bar_low    = low_vals[i]
 
                 if bar_close > rng_high:
                     candidate = "LONG"
@@ -541,6 +558,35 @@ class BacktestEngine:
                     if bar_volume < hist_ov * rvol_mult:
                         last_reason = f"LOW_HIST_RVOL {bar_volume:,.0f} < {rvol_mult:.1f}×{hist_ov:,.0f}"
                         continue
+
+                # Breakout strength: close must extend X% beyond the ORB boundary
+                if min_breakout_strength_pct > 0:
+                    boundary = rng_high if candidate == "LONG" else rng_low
+                    if candidate == "LONG":
+                        min_close = boundary * (1 + min_breakout_strength_pct / 100)
+                        if bar_close < min_close:
+                            last_reason = f"WEAK_STRENGTH close={bar_close:.2f} < {min_close:.2f}"
+                            continue
+                    else:
+                        max_close = boundary * (1 - min_breakout_strength_pct / 100)
+                        if bar_close > max_close:
+                            last_reason = f"WEAK_STRENGTH close={bar_close:.2f} > {max_close:.2f}"
+                            continue
+
+                # Bar quality: close must be in the top (LONG) or bottom (SHORT) fraction
+                if min_bar_close_ratio > 0:
+                    br = bar_high - bar_low
+                    if br > 0:
+                        if candidate == "LONG":
+                            close_ratio = (bar_close - bar_low) / br
+                            if close_ratio < min_bar_close_ratio:
+                                last_reason = f"WEAK_BAR_CLOSE ratio={close_ratio:.2f} < {min_bar_close_ratio:.2f}"
+                                continue
+                        else:
+                            close_ratio = (bar_high - bar_close) / br
+                            if close_ratio < min_bar_close_ratio:
+                                last_reason = f"WEAK_BAR_CLOSE ratio={close_ratio:.2f} < {min_bar_close_ratio:.2f}"
+                                continue
 
                 entry_iloc = i
                 side       = candidate
@@ -760,7 +806,26 @@ class BacktestEngine:
                     tp1_i = int(tp1_mask.argmax()) if tp1_mask.any() else len(after_entry)
                     sl1_i = int(sl1_mask.argmax()) if sl1_mask.any() else len(after_entry)
 
-                    if sl1_mask.any() and sl1_i <= tp1_i:
+                    # Failed-breakout exit (two-leg): exits full position before TP1 or SL
+                    fb1_i = len(after_entry)
+                    if failed_breakout_exit:
+                        fb1_mask = (after_entry["close"].values < rng_high if side == "LONG"
+                                    else after_entry["close"].values > rng_low)
+                        if fb1_mask.any():
+                            fb1_i = int(fb1_mask.argmax())
+
+                    if failed_breakout_exit and fb1_i < sl1_i and fb1_i < tp1_i:
+                        # Failed breakout — exit full position at close of that bar
+                        fb1_close = float(after_entry.iloc[fb1_i]["close"])
+                        leg1_ep = leg2_ep = (
+                            round(fb1_close - slip, 2) if side == "LONG" else round(fb1_close + slip, 2)
+                        )
+                        exit_ts          = after_entry.iloc[fb1_i]["timestamp"]
+                        exit_reason      = "FB"
+                        leg1_exit_reason = None
+                        final_qty1, final_qty2 = total_qty, 0
+
+                    elif sl1_mask.any() and sl1_i <= tp1_i:
                         # SL hit before TP1 — full position exits at SL
                         leg1_ep = leg2_ep = (
                             round(sl - slip, 2) if side == "LONG" else round(sl + slip, 2)
@@ -896,14 +961,27 @@ class BacktestEngine:
                     tp_i = int(tp_hit.argmax()) if tp_hit.any() else len(after_entry)
                     sl_i = int(sl_hit.argmax()) if sl_hit.any() else len(after_entry)
 
-                    if tp_hit.any() and tp_i < sl_i:
+                    # Failed-breakout exit: price closes back inside ORB (earlier than SL)
+                    fb_i = len(after_entry)
+                    if failed_breakout_exit:
+                        fb_mask = (after_entry["close"].values < rng_high if side == "LONG"
+                                   else after_entry["close"].values > rng_low)
+                        if fb_mask.any():
+                            fb_i = int(fb_mask.argmax())
+
+                    if tp_hit.any() and tp_i < sl_i and tp_i <= fb_i:
                         exit_reason = "TP"
                         exit_row    = after_entry.iloc[tp_i]
                         exit_px     = round(tp_px - slip, 2) if side == "LONG" else round(tp_px + slip, 2)
-                    elif sl_hit.any():
+                    elif sl_hit.any() and sl_i <= fb_i:
                         exit_reason = "SL"
                         exit_row    = after_entry.iloc[sl_i]
                         exit_px     = round(sl - slip, 2) if side == "LONG" else round(sl + slip, 2)
+                    elif failed_breakout_exit and fb_i < len(after_entry):
+                        exit_reason = "FB"
+                        exit_row    = after_entry.iloc[fb_i]
+                        fb_close    = float(exit_row["close"])
+                        exit_px     = round(fb_close - slip, 2) if side == "LONG" else round(fb_close + slip, 2)
                     else:
                         exit_reason = "EOD"
                         exit_row    = after_entry.iloc[-1]
@@ -943,6 +1021,74 @@ class BacktestEngine:
         result.spy_equity_curve = _spy_equity_curve
         result.spy_dates        = _spy_dates
         return result
+
+    # ── Portfolio Backtest ─────────────────────────────────────────────────────
+
+    def run_portfolio_backtest(
+        self,
+        symbols: List[str],
+        start_date: date,
+        end_date: date,
+        **kwargs,
+    ):
+        """
+        Run the ORB strategy across multiple symbols and combine into one portfolio result.
+
+        Each symbol is run with the full starting_equity — matching live-bot behaviour
+        where every symbol risks risk_pct_equity % of the account independently.
+        Trades are merged in chronological order and a single equity curve is built by
+        accumulating all PnLs from starting_equity.
+
+        Returns (portfolio_result: BacktestResult, per_symbol: List[BacktestResult])
+        """
+        starting_equity: float = kwargs.get("starting_equity", 100_000.0)
+
+        per_symbol: List[BacktestResult] = []
+        spy_equity_curve: List[float]    = []
+        spy_dates: List[str]             = []
+
+        for sym in symbols:
+            r = self.run_backtest(sym, start_date, end_date, **kwargs)
+            per_symbol.append(r)
+            if not spy_equity_curve and r.spy_equity_curve:
+                spy_equity_curve = r.spy_equity_curve
+                spy_dates        = r.spy_dates
+
+        # Merge all trades chronologically
+        all_trades: List[BacktestTrade] = []
+        total_skipped = 0
+        for r in per_symbol:
+            all_trades.extend(r.trades)
+            total_skipped += len(r.skipped_days)
+        all_trades.sort(key=lambda t: (t.date, t.entry_time))
+
+        # Portfolio label
+        shown = symbols[:4]
+        label = "Portfolio (" + ", ".join(shown)
+        if len(symbols) > 4:
+            label += f" +{len(symbols) - 4}"
+        label += ")"
+
+        orb_min = kwargs.get("orb_minutes", 15)
+
+        portfolio = BacktestResult(
+            symbol            = label,
+            start_date        = str(start_date),
+            end_date          = str(end_date),
+            orb_minutes       = orb_min,
+            risk_ratio        = kwargs.get("risk_ratio", 2.0),
+            stop_loss_type    = kwargs.get("stop_loss_type", "midpoint"),
+            position_size_usd = kwargs.get("position_size_usd", 0.0),
+            risk_pct_equity   = kwargs.get("risk_pct_equity", 1.0),
+            starting_equity   = starting_equity,
+            trades            = all_trades,
+            spy_equity_curve  = spy_equity_curve,
+            spy_dates         = spy_dates,
+        )
+        portfolio.stats        = _compute_stats(all_trades, total_skipped, starting_equity)
+        portfolio.equity_curve = _equity_curve(all_trades, starting_equity)
+
+        return portfolio, per_symbol
 
 
 # ── Statistics ─────────────────────────────────────────────────────────────────
